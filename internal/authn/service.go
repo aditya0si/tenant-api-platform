@@ -300,9 +300,10 @@ func (s *Service) PrincipalForAPIKey(ctx context.Context, raw string) (authz.Pri
 		return authz.Principal{}, err
 	}
 	return authz.Principal{
-		TenantID: key.TenantID,
-		Scopes:   key.Scopes,
-		Method:   authz.MethodAPIKey,
+		TenantID:     key.TenantID,
+		Scopes:       key.Scopes,
+		Method:       authz.MethodAPIKey,
+		CredentialID: key.ID,
 	}, nil
 }
 

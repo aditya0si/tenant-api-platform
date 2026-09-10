@@ -3,7 +3,7 @@ package testsupport
 import (
 	"context"
 	"fmt"
-	"strings"
+	"github.com/aditya0si/tenant-api-platform/internal/platform/idgen"
 	"testing"
 
 	"github.com/google/uuid"
@@ -27,7 +27,7 @@ const fakeHash = "$argon2id$v=19$m=65536,t=1,p=4$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAA
 func NewTenant(t *testing.T, pool *pgxpool.Pool, label string) (tenantID, userID uuid.UUID) {
 	t.Helper()
 
-	suffix := strings.ReplaceAll(uuid.Must(uuid.NewV7()).String(), "-", "")[:12]
+	suffix := idgen.ShortSuffix(12)
 	tenantID = uuid.Must(uuid.NewV7())
 	userID = uuid.Must(uuid.NewV7())
 
@@ -52,7 +52,7 @@ func AddUser(t *testing.T, pool *pgxpool.Pool, label string) uuid.UUID {
 	t.Helper()
 
 	id := uuid.Must(uuid.NewV7())
-	suffix := strings.ReplaceAll(uuid.Must(uuid.NewV7()).String(), "-", "")[:12]
+	suffix := idgen.ShortSuffix(12)
 	_, err := pool.Exec(context.Background(),
 		`INSERT INTO users (id, email, pw_hash) VALUES ($1, $2, $3)`,
 		id, fmt.Sprintf("member-%s@%s.test", suffix, label), fakeHash)

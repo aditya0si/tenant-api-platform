@@ -31,6 +31,22 @@ var (
 
 	// ErrValidation is returned when input fails validation at the boundary.
 	ErrValidation = errors.New("validation failed")
+
+	// ErrVersionConflict is returned when an update is rejected because the row
+	// changed after the caller read it.
+	//
+	// It is distinct from ErrConflict (a uniqueness violation) because the two
+	// need different client behaviour: a uniqueness conflict means "pick another
+	// name", while a version conflict means "re-read the resource and reapply your
+	// change", and collapsing them would leave the client retrying a doomed write
+	// or discarding a change that only needed a re-read.
+	ErrVersionConflict = errors.New("version conflict")
+
+	// ErrUnavailable is returned when a dependency the request needs is
+	// unreachable. It is separated from a generic failure so the HTTP layer can
+	// answer 503 (retryable) rather than 500 (a bug), which is the difference
+	// between a load balancer retrying and an operator being paged.
+	ErrUnavailable = errors.New("dependency unavailable")
 )
 
 // Is reports whether err (or anything it wraps) is target.

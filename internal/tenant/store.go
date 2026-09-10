@@ -278,12 +278,10 @@ func (s *Store) AddMember(ctx context.Context, auth Authorized, userID uuid.UUID
 
 // identityFor derives the row-level-security identity from an authorized caller.
 //
-// Both fields come from the same value, so a scoped query cannot be issued with a
-// tenant and a principal that were authorized separately — or with one of them
-// missing, which is the failure mode described in access.go.
-func identityFor(auth Authorized) db.Identity {
-	return db.Identity{TenantID: auth.Scope().ID(), UserID: auth.UserID()}
-}
+// It delegates to Authorized.Identity so that there is exactly one place where the
+// tenant/user pair is assembled; a second copy here would be a second thing to
+// update, and the copy that drifts is always the one that runs.
+func identityFor(auth Authorized) db.Identity { return auth.Identity() }
 
 // translate maps Postgres constraint violations onto sentinel errors so callers
 // never have to inspect driver error codes.

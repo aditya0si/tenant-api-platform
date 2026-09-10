@@ -43,6 +43,16 @@ type Principal struct {
 	Role     Role
 	Scopes   []Perm
 	Method   AuthMethod
+
+	// CredentialID identifies the credential itself when it is not a user session:
+	// today, the API key's id. It exists for attribution — "which key did this" is
+	// the only useful answer for an unattended action — and it is what lets the
+	// tenant middleware build a machine authorization without re-reading the key.
+	//
+	// It is deliberately not the UserID. A key is not a person, and reusing one field
+	// for both would make "attribute this to a user" and "attribute this to a key"
+	// indistinguishable at exactly the moment the distinction matters.
+	CredentialID uuid.UUID
 }
 
 // Allows reports whether the caller may perform perm.

@@ -30,6 +30,23 @@ services:
       timeout: 3s
       retries: 10
 
+  # Runs the migrations once, then exits. The API waits for it to complete so a
+  # fresh `docker compose up` produces a migrated database instead of an API that
+  # is up but failing every request.
+  #
+  # entrypoint is overridden because the image's default entrypoint is /bin/api;
+  # without this the `command` would be passed as arguments to the API binary.
+  migrate:
+    build: .
+    container_name: tap-migrate
+    entrypoint: ["/bin/migrate", "up"]
+    environment:
+      MIGRATE_DATABASE_URL: postgres://postgres:postgres@postgres:5432/tenant_platform?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   api:
     build: .
     container_name: tap-api
@@ -38,7 +55,14 @@ services:
     environment:
       APP_ENV: dev
       PORT: "8080"
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/tenant_platform?sslmode=disable
+      # The API authenticates as the unprivileged application role, NOT as the
+      # postgres superuser. Superusers and BYPASSRLS roles ignore row-level
+      # security entirely, so connecting as postgres would make every tenant
+      # policy in migrations/0001 decorative — the isolation tests would still
+      # pass, because they would be measuring application-level filtering only.
+      # The role is created by the migration and provisioned out-of-band in
+      # production (see docs/adr/ADR-003-tenancy-and-rls.md).
+      DATABASE_URL: postgres://app_rw:app_rw@postgres:5432/tenant_platform?sslmode=disable
       REDIS_URL: redis://redis:6379/0
       LOG_LEVEL: info
     depends_on:
@@ -46,6 +70,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   pgdata:

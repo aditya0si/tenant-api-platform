@@ -1,0 +1,20 @@
+# Normalize line endings: CI runs on Linux, development happens on Windows.
+# Without this, every commit emits CRLF warnings and diffs churn.
+* text=auto eol=lf
+
+*.go   text eol=lf
+*.sql  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+
+# Binary artifacts must never be normalized.
+*.png  binary
+*.jpg  binary
+*.pdf  binary
+*.gz   binary
+*.exe  binary
+
+# Vendored and generated files are excluded from language stats and diffs.
+third_party/** linguist-vendored

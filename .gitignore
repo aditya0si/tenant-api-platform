@@ -1,0 +1,6 @@
+bin/
+dist/
+*.exe
+.env
+.env.production
+coverage.out

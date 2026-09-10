@@ -89,12 +89,17 @@ func collectAttrs(r slog.Record) []slog.Attr {
 
 // redactAttrs replaces sensitive values in place, recursing into groups so a
 // nested {"auth": {"token": ...}} is caught too.
+//
+// The Kind check is load-bearing: slog.Value.Group() panics unless the value's
+// kind is KindGroup, so probing with Group() to test "is this a group?" crashes
+// the logger on the first ordinary string attribute. The test suite caught
+// exactly that, which is a good argument for exercising the logger rather than
+// assuming a wrapper is transparent.
 func redactAttrs(attrs []slog.Attr) []slog.Attr {
 	for i := range attrs {
 		a := &attrs[i]
-		if len(a.Value.Group()) > 0 {
-			grouped := a.Value.Group()
-			a.Value = slog.GroupValue(redactAttrs(grouped)...)
+		if a.Value.Kind() == slog.KindGroup {
+			a.Value = slog.GroupValue(redactAttrs(a.Value.Group())...)
 			continue
 		}
 		if isSensitiveKey(a.Key) || hasSensitiveValue(a.Value) {

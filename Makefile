@@ -9,13 +9,14 @@ TEST_URL_APP   ?= postgres://app_rw:app_rw@localhost:5432/$(TEST_DB)?sslmode=dis
 export MIGRATE_DATABASE_URL := $(PG_URL_OWNER)
 export DATABASE_URL := $(PG_URL_APP)
 
-.PHONY: help tidy fmt vet test test-db build up down logs psql migrate seed testdb-clean
+.PHONY: help tidy fmt vet test test-db build up down logs psql migrate seed sweep testdb-clean
 
 help:
 	@echo "make up          start postgres + redis + migrate + api"
 	@echo "make test        run the full suite against a throwaway test database"
 	@echo "make test-unit   run only tests that need no database"
 	@echo "make migrate     apply migrations to the dev database"
+	@echo "make sweep       reap expired idempotency keys (owner credentials; see docs/OPERATIONS.md)"
 	@echo "make seed        create two demo tenants"
 	@echo "make psql        open a psql shell as the application role"
 
@@ -67,6 +68,12 @@ logs:
 
 migrate:
 	go run ./cmd/migrate up
+
+# Reaping spans tenants, so it needs a role that bypasses row-level security — the same
+# owner credentials migrations use. The dev default PG_URL_OWNER is the postgres superuser,
+# which satisfies that. See docs/OPERATIONS.md for why the guard exists.
+sweep:
+	go run ./cmd/migrate sweep
 
 seed:
 	go run ./cmd/migrate seed

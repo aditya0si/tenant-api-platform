@@ -31,6 +31,7 @@ import (
 
 	"github.com/aditya0si/tenant-api-platform/internal/authn"
 	"github.com/aditya0si/tenant-api-platform/internal/httpx"
+	"github.com/aditya0si/tenant-api-platform/internal/idempotency"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/cache"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/config"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/cursor"
@@ -113,6 +114,16 @@ func run() error {
 	tenants := tenant.NewStore(pool)
 	projects := project.NewStore(pool)
 
+	// Idempotency retention and lease are deliberately not configurable.
+	//
+	// Both are coupled to code constants rather than to deployment policy: the lease must
+	// exceed the per-request timeout (15s, a const in the httpx package) or a live handler
+	// gets taken over, and the retention must exceed any realistic client retry schedule or
+	// a retry lands after the key was forgotten and causes the second effect the protocol
+	// exists to prevent. A knob nobody can meaningfully tune is a knob that misleads, so
+	// these stay put until a deployment has a measured reason to differ.
+	idempotencyStore := idempotency.NewStore(pool, 0, 0)
+
 	authService, err := authn.NewService(
 		authn.NewUserStore(pool),
 		tokens,
@@ -134,6 +145,7 @@ func run() error {
 		Tenants:        tenants,
 		Projects:       projects,
 		Cursors:        codec,
+		Idempotency:    idempotencyStore,
 		AccessTokenTTL: int(cfg.AccessTokenTTL.Seconds()),
 	})
 

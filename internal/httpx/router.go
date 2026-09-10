@@ -12,6 +12,7 @@ import (
 
 	"github.com/aditya0si/tenant-api-platform/internal/authn"
 	"github.com/aditya0si/tenant-api-platform/internal/authz"
+	"github.com/aditya0si/tenant-api-platform/internal/idempotency"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/cursor"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/httperr"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/metrics"
@@ -40,9 +41,21 @@ type Deps struct {
 	Projects *project.Store
 	Cursors  *cursor.Codec
 
+	// Idempotency implements the idempotency-key protocol for unsafe requests. A nil
+	// value disables the middleware's recording, which tests use to isolate other
+	// behaviour; production always supplies one.
+	Idempotency *idempotency.Store
+
 	// AccessTokenTTL is reported to clients so they know when to refresh without
 	// hard-coding a value that lives in configuration.
 	AccessTokenTTL int
+}
+
+// requirePerm is the authorization middleware as a plain function, so a composition like
+// writeGuard can apply it without going through chi's With().
+func requirePerm(perm string) func(http.Handler) http.Handler {
+	p := authz.Perm(perm)
+	return authz.Require(p)
 }
 
 // New builds the router.
@@ -126,14 +139,25 @@ func New(d Deps) http.Handler {
 		r.Post("/members", d.handleAddMember)
 
 		r.Route("/projects", func(r chi.Router) {
-			// Read requires project:read; every mutation requires project:write.
-			// Putting the permission on the group rather than the handler means a
-			// new route cannot be added without inheriting a check.
+			// Reads are safe, so they need only the read permission — and deliberately no
+			// idempotency, because a GET has no effect to duplicate.
 			r.With(authz.Require(authz.PermProjectRead)).Get("/", d.handleListProjects)
 			r.With(authz.Require(authz.PermProjectRead)).Get("/{projectID}", d.handleGetProject)
-			r.With(authz.Require(authz.PermProjectWrite)).Post("/", d.handleCreateProject)
-			r.With(authz.Require(authz.PermProjectWrite)).Patch("/{projectID}", d.handleUpdateProject)
-			r.With(authz.Require(authz.PermProjectWrite)).Delete("/{projectID}", d.handleArchiveProject)
+
+			// Writes are grouped so both guards apply to every one of them, in the order
+			// that matters: authorization, then idempotency.
+			//
+			// The ordering is enforced by writeGuard rather than by listing two r.Use calls,
+			// because the wrong order is invisible in review — idempotency first still looks
+			// correct while letting an unauthorized caller claim rows in the table. A route
+			// added to this group inherits both; a route added outside it is visibly outside.
+			r.Group(func(r chi.Router) {
+				r.Use(writeGuard(string(authz.PermProjectWrite), d.Idempotency, d.Log))
+
+				r.Post("/", d.handleCreateProject)
+				r.Patch("/{projectID}", d.handleUpdateProject)
+				r.Delete("/{projectID}", d.handleArchiveProject)
+			})
 		})
 	})
 

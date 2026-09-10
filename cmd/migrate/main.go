@@ -23,6 +23,7 @@ import (
 
 	"github.com/aditya0si/tenant-api-platform/internal/authn"
 	"github.com/aditya0si/tenant-api-platform/internal/authz"
+	"github.com/aditya0si/tenant-api-platform/internal/idempotency"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/apperr"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/db"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/migrations"
@@ -51,6 +52,8 @@ func main() {
 		err = runStatus(ctx)
 	case "seed":
 		err = runSeed(ctx)
+	case "sweep":
+		err = runSweep(ctx)
 	default:
 		usage()
 		os.Exit(2)
@@ -67,6 +70,7 @@ func usage() {
 commands:
   up      apply pending migrations (needs MIGRATE_DATABASE_URL)
   status  show applied migrations  (needs MIGRATE_DATABASE_URL)
+  sweep   delete expired idempotency keys (needs owner credentials: see docs/OPERATIONS.md)
   seed    insert demo tenants      (needs DATABASE_URL, the application role)
 
 environment:
@@ -160,6 +164,37 @@ func runSeed(ctx context.Context) error {
 
 	fmt.Printf("\nseed login password for both owners: %s\n", seedPassword)
 	fmt.Println("probe isolation: request tenant A with tenant B's credentials and expect 404, never 403")
+	return nil
+}
+
+// runSweep deletes expired idempotency records.
+//
+// # Why this is a command and not a goroutine in the API
+//
+// A sweep spans tenants by definition, and idempotency_keys carries FORCE row-level
+// security. It therefore has to run on a role that bypasses the policy — the same owner role
+// that applies migrations — while the service deliberately runs as the unprivileged
+// application role. Putting it in the API would mean shipping owner credentials inside the
+// service, which is the arrangement the whole tenancy design exists to avoid.
+//
+// Store.Sweep refuses if the connected role is subject to row-level security, rather than
+// deleting nothing and reporting success: a reaper that silently returns zero every night is
+// indistinguishable from a healthy one until the disk fills.
+func runSweep(ctx context.Context) error {
+	pool, err := connect(ctx, ownerURL())
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+
+	// The count is printed even when it is zero, because "swept 0" from a role that can
+	// actually see every tenant is real information, while the same output from a filtered
+	// role would be a lie — and the guard above is what separates the two.
+	removed, err := idempotency.NewStore(pool, 0, 0).Sweep(ctx, 0)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("swept %d expired idempotency record(s)\n", removed)
 	return nil
 }
 

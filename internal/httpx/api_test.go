@@ -31,6 +31,7 @@ import (
 	"github.com/aditya0si/tenant-api-platform/internal/authn"
 	"github.com/aditya0si/tenant-api-platform/internal/authz"
 	"github.com/aditya0si/tenant-api-platform/internal/httpx"
+	"github.com/aditya0si/tenant-api-platform/internal/idempotency"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/cursor"
 	"github.com/aditya0si/tenant-api-platform/internal/project"
 	"github.com/aditya0si/tenant-api-platform/internal/tenant"
@@ -51,6 +52,12 @@ type server struct {
 	projects *project.Store
 	users    *authn.UserStore
 	keys     *authn.APIKeyStore
+
+	// idem and db let a test reach past the API — to claim a key directly, to count rows
+	// the response cannot show, or to backdate a row so expiry can be driven without
+	// sleeping. Tests that need only HTTP behaviour ignore them.
+	idem *idempotency.Store
+	db   *testsupport.DB
 }
 
 // serverConfig allows a test to vary the few settings that change observable
@@ -93,6 +100,11 @@ func newServerWith(t *testing.T, cfg serverConfig) *server {
 	projects := project.NewStore(d.App)
 	keys := authn.NewAPIKeyStore(d.App)
 
+	// The real store, with production lease and retention. A test that needs a different
+	// lease backdates the row instead of shrinking the constant, so the SQL under test is
+	// the same SQL that runs in production.
+	idem := idempotency.NewStore(d.App, 0, 0)
+
 	svc, err := authn.NewService(
 		users, tokens,
 		authn.NewRefreshStore(d.App, cfg.refreshGrace),
@@ -111,16 +123,26 @@ func newServerWith(t *testing.T, cfg serverConfig) *server {
 		Tenants:        tenants,
 		Projects:       projects,
 		Cursors:        codec,
+		Idempotency:    idem,
 		AccessTokenTTL: 600,
 	})
 
-	return &server{t: t, handler: handler, tenants: tenants, projects: projects, users: users, keys: keys}
+	return &server{
+		t: t, handler: handler, tenants: tenants, projects: projects,
+		users: users, keys: keys, idem: idem, db: d,
+	}
 }
 
 // response is a decoded API response.
 type response struct {
 	status int
 	body   []byte
+
+	// header is kept because some behaviour is only observable in headers: the
+	// idempotency replay marker, Retry-After, and the Set-Cookie that must never be
+	// replayed. A test that could see only status and body would have to assert on
+	// those indirectly, or not at all.
+	header http.Header
 }
 
 // decodeEnvelope unmarshals the whole response body into dst.
@@ -165,6 +187,15 @@ func (r response) decodeData(t *testing.T, dst any) {
 
 // do issues a request. token may be empty for an unauthenticated call.
 func (s *server) do(method, path string, body any, token string) response {
+	return s.doWithKey(method, path, body, token, "")
+}
+
+// doWithKey issues a request carrying an idempotency key.
+//
+// An empty key sends no header, so one helper covers both the protected and the
+// unprotected path and a test can compare them without two request builders that could
+// drift apart.
+func (s *server) doWithKey(method, path string, body any, token, key string) response {
 	s.t.Helper()
 
 	var reader io.Reader
@@ -183,6 +214,9 @@ func (s *server) do(method, path string, body any, token string) response {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	if key != "" {
+		req.Header.Set(idempotency.Header, key)
+	}
 
 	rec := httptest.NewRecorder()
 	s.handler.ServeHTTP(rec, req)
@@ -194,7 +228,7 @@ func (s *server) do(method, path string, body any, token string) response {
 	if rec.Header().Get("X-Request-Id") == "" {
 		s.t.Errorf("%s %s returned no X-Request-Id header", method, path)
 	}
-	return response{status: rec.Code, body: rec.Body.Bytes()}
+	return response{status: rec.Code, body: rec.Body.Bytes(), header: rec.Header()}
 }
 
 // doAPIKey issues a request authenticated with an API key.
@@ -217,7 +251,7 @@ func (s *server) doAPIKey(method, path string, body any, key string) response {
 
 	rec := httptest.NewRecorder()
 	s.handler.ServeHTTP(rec, req)
-	return response{status: rec.Code, body: rec.Body.Bytes()}
+	return response{status: rec.Code, body: rec.Body.Bytes(), header: rec.Header()}
 }
 
 // --- session plumbing --------------------------------------------------------

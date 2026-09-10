@@ -1,7 +1,7 @@
 // Package migrations embeds the schema migrations and applies them
 // forward-only under a Postgres advisory lock.
 //
-// Design notes (see docs/adr/ADR-014-migrations.md):
+// Design notes (see docs/adr/ADR-011-migrations.md):
 //   - Forward-only. A failed migration rolls back atomically because each file
 //     runs inside its own transaction; corrections ship as new files.
 //   - A checksum is recorded per applied migration, so editing history is

@@ -28,6 +28,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/aditya0si/tenant-api-platform/internal/audit"
 	"github.com/aditya0si/tenant-api-platform/internal/authn"
 	"github.com/aditya0si/tenant-api-platform/internal/authz"
 	"github.com/aditya0si/tenant-api-platform/internal/httpx"
@@ -58,6 +59,10 @@ type server struct {
 	// sleeping. Tests that need only HTTP behaviour ignore them.
 	idem *idempotency.Store
 	db   *testsupport.DB
+
+	// audit reads the trail directly, so a test can assert on what was recorded rather
+	// than only on what the endpoint chose to return.
+	audit *audit.Reader
 }
 
 // serverConfig allows a test to vary the few settings that change observable
@@ -111,6 +116,7 @@ func newServerWith(t *testing.T, cfg serverConfig) *server {
 	// lease backdates the row instead of shrinking the constant, so the SQL under test is
 	// the same SQL that runs in production.
 	idem := idempotency.NewStore(d.App, 0, 0)
+	auditReader := audit.NewReader(d.App)
 
 	svc, err := authn.NewService(
 		users, tokens,
@@ -130,6 +136,7 @@ func newServerWith(t *testing.T, cfg serverConfig) *server {
 		Tenants:        tenants,
 		Projects:       projects,
 		Cursors:        codec,
+		Audit:          auditReader,
 		Idempotency:    idem,
 		RateLimits:     cfg.rateLimits,
 		AccessTokenTTL: 600,
@@ -137,7 +144,7 @@ func newServerWith(t *testing.T, cfg serverConfig) *server {
 
 	return &server{
 		t: t, handler: handler, tenants: tenants, projects: projects,
-		users: users, keys: keys, idem: idem, db: d,
+		users: users, keys: keys, idem: idem, db: d, audit: auditReader,
 	}
 }
 

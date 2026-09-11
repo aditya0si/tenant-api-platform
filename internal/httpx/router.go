@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/aditya0si/tenant-api-platform/internal/audit"
 	"github.com/aditya0si/tenant-api-platform/internal/authn"
 	"github.com/aditya0si/tenant-api-platform/internal/authz"
 	"github.com/aditya0si/tenant-api-platform/internal/idempotency"
@@ -40,6 +41,12 @@ type Deps struct {
 	Tenants  *tenant.Store
 	Projects *project.Store
 	Cursors  *cursor.Codec
+
+	// Audit reads the append-only trail. There is deliberately no writer here: entries are
+	// recorded by the operations they describe, inside those operations' transactions, so
+	// the HTTP layer can only ever read them. A nil value makes the endpoint report
+	// not-found, which is what a router assembled without one should do.
+	Audit *audit.Reader
 
 	// Idempotency implements the idempotency-key protocol for unsafe requests. A nil
 	// value disables the middleware's recording, which tests use to isolate other
@@ -175,6 +182,11 @@ func New(d Deps) http.Handler {
 		r.Get("/", d.handleGetTenant)
 		r.Get("/members", d.handleListMembers)
 		r.Post("/members", d.handleAddMember)
+
+		// The audit trail is readable by anyone holding audit:read — admin and owner, not
+		// member. It names who did what, including API keys and request ids, so an admin who
+		// can rename a workspace is not automatically able to enumerate its users' actions.
+		r.With(authz.Require(authz.PermAuditRead)).Get("/audit", d.handleListAudit)
 
 		r.Route("/projects", func(r chi.Router) {
 			// Reads are safe, so they need only the read permission — and deliberately no

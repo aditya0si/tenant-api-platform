@@ -29,6 +29,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/aditya0si/tenant-api-platform/internal/audit"
 	"github.com/aditya0si/tenant-api-platform/internal/authn"
 	"github.com/aditya0si/tenant-api-platform/internal/httpx"
 	"github.com/aditya0si/tenant-api-platform/internal/idempotency"
@@ -144,6 +145,7 @@ func run() error {
 
 	tenants := tenant.NewStore(pool)
 	projects := project.NewStore(pool)
+	auditReader := audit.NewReader(pool)
 
 	// Idempotency retention and lease are deliberately not configurable.
 	//
@@ -176,6 +178,7 @@ func run() error {
 		Tenants:        tenants,
 		Projects:       projects,
 		Cursors:        codec,
+		Audit:          auditReader,
 		Idempotency:    idempotencyStore,
 		RateLimits:     &limits,
 		AccessTokenTTL: int(cfg.AccessTokenTTL.Seconds()),

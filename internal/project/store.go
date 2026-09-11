@@ -11,11 +11,55 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/aditya0si/tenant-api-platform/internal/audit"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/apperr"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/cursor"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/db"
+	"github.com/aditya0si/tenant-api-platform/internal/platform/reqid"
 	"github.com/aditya0si/tenant-api-platform/internal/tenant"
 )
+
+// auditImage is the audited form of a project: the fields the API exposes, never the raw row.
+//
+// The trail is append-only and cannot be pruned, so whatever goes in stays. That is why the
+// image is built explicitly here rather than by marshalling the struct: adding a field to
+// Project would otherwise start publishing it into a permanent record, silently, with no
+// reviewer looking at that consequence.
+func auditImage(p Project) map[string]any {
+	return map[string]any{
+		"id":          p.ID.String(),
+		"name":        p.Name,
+		"slug":        p.Slug,
+		"description": p.Description,
+		"version":     p.Version,
+		"archived_at": p.ArchivedAt,
+	}
+}
+
+// auditProject records one project mutation inside the caller's transaction.
+//
+// It takes the tx rather than opening its own, which is the entire guarantee: the entry and
+// the change commit together or neither does. Recording after the fact from another
+// transaction would leave a changed resource with no entry whenever the process died in
+// between — and an attacker able to make the recorder fail would act unlogged.
+func auditProject(ctx context.Context, tx pgx.Tx, auth tenant.Authorized, action string, p Project, before, after any) error {
+	actorID, actorKind, err := audit.ActorFromAuthorized(auth)
+	if err != nil {
+		return err
+	}
+	id := p.ID
+	return audit.Write(ctx, tx, audit.Entry{
+		TenantID:   p.TenantID,
+		ActorID:    actorID,
+		ActorKind:  actorKind,
+		Action:     action,
+		Resource:   "project",
+		ResourceID: &id,
+		Before:     before,
+		After:      after,
+		RequestID:  reqid.From(ctx),
+	})
+}
 
 // Store is the project repository.
 //
@@ -90,7 +134,13 @@ func (s *Store) Create(ctx context.Context, auth tenant.Authorized, in CreateInp
 			VALUES ($1, $2, $3, $4, $5, 1, $6, $7)
 			RETURNING `+selectColumns,
 			p.ID, p.TenantID, p.Name, p.Slug, p.Description, p.CreatedBy, p.CreatedByKey))
-		return scanErr
+		if scanErr != nil {
+			return scanErr
+		}
+		// Recorded inside this transaction. A create has no before image, so Before is nil
+		// and the column is NULL rather than the four bytes "null" — which is what makes
+		// `before IS NULL` the query that finds creations.
+		return auditProject(ctx, tx, auth, audit.ActionProjectCreate, p, nil, auditImage(p))
 	})
 	if err != nil {
 		// The partial unique index is on (tenant_id, slug) WHERE archived_at IS NULL, so
@@ -176,6 +226,21 @@ func (s *Store) Update(ctx context.Context, auth tenant.Authorized, id uuid.UUID
 		got     bool
 	)
 	err := db.WithIdentityTx(ctx, s.pool, auth.Identity(), func(tx pgx.Tx) error {
+		// Capture the pre-image for the audit entry, ignoring "no such row" — the
+		// classification below is unchanged and remains the authority on why a write did not
+		// happen. This read cannot reintroduce the lost update that the version predicate
+		// prevents: the UPDATE still carries `version = $5`, so it can only succeed if the
+		// row is still in the state just read, and the image is used only when it succeeds.
+		before, preErr := scanProject(tx.QueryRow(ctx,
+			`SELECT `+selectColumns+` FROM projects WHERE id = $1 AND tenant_id = $2`,
+			id, auth.Scope().ID()))
+		switch {
+		case errors.Is(preErr, pgx.ErrNoRows):
+			before = Project{}
+		case preErr != nil:
+			return fmt.Errorf("read project before update: %w", preErr)
+		}
+
 		// COALESCE keeps an omitted field unchanged: a nil pointer means "not supplied",
 		// which is deliberately distinct from a pointer to the empty string, which means
 		// "set it to empty".
@@ -194,6 +259,10 @@ func (s *Store) Update(ctx context.Context, auth tenant.Authorized, id uuid.UUID
 		switch {
 		case err == nil:
 			p, got = updated, true
+			if aErr := auditProject(ctx, tx, auth, audit.ActionProjectUpdate, p,
+				auditImage(before), auditImage(p)); aErr != nil {
+				return aErr
+			}
 			return nil
 		case !errors.Is(err, pgx.ErrNoRows):
 			return fmt.Errorf("update project: %w", err)
@@ -257,6 +326,18 @@ func (s *Store) Archive(ctx context.Context, auth tenant.Authorized, id uuid.UUI
 	}
 
 	return db.WithIdentityTx(ctx, s.pool, auth.Identity(), func(tx pgx.Tx) error {
+		// Pre-image for the audit entry, ignored when absent — the branches below already
+		// classify why the write did not happen, and they stay the authority.
+		before, preErr := scanProject(tx.QueryRow(ctx,
+			`SELECT `+selectColumns+` FROM projects WHERE id = $1 AND tenant_id = $2`,
+			id, auth.Scope().ID()))
+		switch {
+		case errors.Is(preErr, pgx.ErrNoRows):
+			before = Project{}
+		case preErr != nil:
+			return fmt.Errorf("read project before archive: %w", preErr)
+		}
+
 		tag, err := tx.Exec(ctx, `
 			UPDATE projects
 			   SET archived_at = now(), updated_at = now(), version = version + 1
@@ -266,7 +347,18 @@ func (s *Store) Archive(ctx context.Context, auth tenant.Authorized, id uuid.UUI
 			return fmt.Errorf("archive project: %w", err)
 		}
 		if tag.RowsAffected() == 1 {
-			return nil
+			// Audited only on the real transition. A retry of an already-archived project
+			// succeeds without changing anything, and recording it would fill the trail with
+			// entries claiming a state change that never happened — the trail's only job is
+			// to be trustworthy.
+			archived, readErr := scanProject(tx.QueryRow(ctx,
+				`SELECT `+selectColumns+` FROM projects WHERE id = $1 AND tenant_id = $2`,
+				id, auth.Scope().ID()))
+			if readErr != nil {
+				return fmt.Errorf("read project after archive: %w", readErr)
+			}
+			return auditProject(ctx, tx, auth, audit.ActionProjectArchive, archived,
+				auditImage(before), auditImage(archived))
 		}
 
 		var archivedAt *time.Time

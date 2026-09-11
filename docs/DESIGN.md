@@ -13,7 +13,7 @@ Single-repo Project 1. Project 2 (streaming) starts only after this ships with b
 1. Orgs/tenants, users, memberships, roles `owner > admin > member`, RBAC permission map in code.
 2. Auth: password (argon2id) + short-lived JWT access (10m) + opaque refresh family with rotation + reuse detection; API keys (`ak_` prefix, SHA-256 stored).
 3. Projects CRUD, tenant-scoped. Invoices: line items, totals in minor units, state machine `draft → open → paid | void` with compare-and-set + append-only events.
-4. Cross-cutting: cursor pagination, idempotency keys on unsafe methods, distributed rate limiting, audit log, webhooks via transactional outbox + retries + DLQ + replay + SSRF guard, OpenAPI with contract test (spec and contract test pending; see ADR-010), structured logs/metrics/traces, health/readiness.
+4. Cross-cutting: cursor pagination, idempotency keys on unsafe methods, distributed rate limiting, audit log, webhooks via transactional outbox + retries + DLQ + replay + SSRF guard, OpenAPI with a contract test (`docs/openapi.yaml`, 35 operations, checked against the router in both directions — see ADR-010), structured logs/metrics, health/readiness.
 5. Ops: `docker compose up` from fresh clone; seed; migrate; CI green; k6-measured numbers.
 
 Non-requirements: no payments/PSP, no multi-region, no blue/green, no DB-driven policy engine, no NATS/Kafka in P1, no AI features, no microservices.

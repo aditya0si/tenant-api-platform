@@ -19,7 +19,7 @@ that shaped the code.
 | Tenancy | Tenants, users, memberships, `owner > admin > member`, permission map in code |
 | Auth | argon2id passwords; 10-minute HS256 access tokens; refresh tokens in rotating families with reuse detection; `ak_` API keys stored as SHA-256 |
 | Billing | Invoices with line items; money as `int64` minor units; `draft → open → paid` and `void` transitions guarded by compare-and-set; append-only invoice events |
-| Cross-cutting | HMAC-signed keyset pagination; `Idempotency-Key` protocol; Redis Lua rate limiting; append-only audit log; webhooks via transactional outbox with retries, a dead-letter queue, and replay |
+| Cross-cutting | HMAC-signed keyset pagination; `Idempotency-Key` protocol; Redis Lua rate limiting; append-only audit log; webhooks via transactional outbox with retries, a dead-letter queue, and replay; a hand-written [OpenAPI spec](docs/openapi.yaml) checked against the router |
 
 ## Architecture
 
@@ -126,8 +126,9 @@ Reproduce with `make load-seed && make load`.
 M0–M8 are implemented, tested, and committed: tenancy, authentication, projects, invoices,
 idempotency, rate limiting, audit, webhooks, and API-key management. CI is green on `main`.
 
-Not done yet, and stated rather than implied: the hand-written OpenAPI spec and its contract test
-([ADR-010](docs/adr/ADR-010-router-and-openapi.md)), and a deployed instance.
+Not done yet, and stated rather than implied: a deployed instance. Tracing is correlation-id
+propagation, not OpenTelemetry — no span is created or exported, and
+[`docs/DESIGN.md`](docs/DESIGN.md) says so rather than implying otherwise.
 
 ## License
 

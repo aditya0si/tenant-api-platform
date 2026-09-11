@@ -1,0 +1,1670 @@
+openapi: 3.1.0
+
+info:
+  title: tenant-api-platform
+  version: "0.9.0"
+  description: |
+    A multi-tenant billing API: tenants, members and roles, projects, invoices with a
+    compare-and-set state machine, an append-only audit trail, machine credentials, and webhook
+    delivery through a transactional outbox.
+
+    This document is written by hand (ADR-010) and is checked against the router in both
+    directions by `internal/httpx/openapi_test.go`: a route the router serves that is missing here,
+    and an operation documented here that is not served, both fail the build.
+
+    Conventions:
+      * Every success body wraps its payload as `{"data": ...}`. Listings add `next_cursor`.
+      * Every error body is `{"error": {"code", "message", "request_id", "details"?}}`.
+      * Money is an integer in minor units (ADR-008). Ids are UUIDv7 (ADR-007).
+      * Timestamps are RFC 3339 in UTC.
+      * Cross-tenant access answers 404, never 403 (ADR-003).
+  license:
+    name: MIT
+    identifier: MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Local development — `docker compose up`, or `go run ./cmd/api`.
+
+tags:
+  - name: infrastructure
+    description: Probes and metrics. Not part of the client API.
+  - name: auth
+    description: Registration, login, token refresh, logout.
+  - name: tenants
+    description: Tenant lookup and creation.
+  - name: members
+    description: Membership and roles.
+  - name: projects
+    description: Tenant-scoped projects.
+  - name: invoices
+    description: Invoices, line items, and the draft → open → paid | void lifecycle.
+  - name: webhooks
+    description: Endpoint registration, delivery history, and replay.
+  - name: api-keys
+    description: Machine credentials scoped to one tenant.
+  - name: audit
+    description: The append-only trail. Read-only by design.
+
+security: []
+
+paths:
+  /healthz:
+    get:
+      tags: [infrastructure]
+      summary: Liveness
+      operationId: healthz
+      description: |
+        Answers 200 while the process is running. It deliberately checks nothing external: a
+        liveness probe that fails when a dependency is down makes an orchestrator restart a healthy
+        process and turns a partial outage into a full one.
+      responses:
+        "200":
+          description: The process is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, const: ok}
+                required: [status]
+
+  /readyz:
+    get:
+      tags: [infrastructure]
+      summary: Readiness
+      operationId: readyz
+      description: |
+        Postgres is required, so its failure is 503 and removes the instance from rotation. Redis is
+        not: the rate limiter fails open when Redis is unreachable, so a Redis outage degrades a
+        protection rather than breaking requests, and the response reports `degraded` instead.
+      responses:
+        "200":
+          description: Ready, or degraded but serving.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, enum: [ready, degraded]}
+                  redis: {type: string}
+                required: [status]
+        "503":
+          description: The database is unreachable.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, const: not_ready}
+                  reason: {type: string, const: database_unreachable}
+                required: [status]
+
+  /v1/auth/register:
+    post:
+      tags: [auth]
+      summary: Create an account and its first tenant
+      operationId: register
+      description: |
+        Creates the user, then a personal tenant they own, then logs them in. The user and tenant
+        are written in separate transactions because they belong to different aggregates; if the
+        tenant step fails the account still exists and the caller can create a tenant through
+        `POST /v1/tenants`.
+
+        Rate limited per address (PolicyRegister: 5 per hour). That limit is why `cmd/loadseed`
+        exists — a load test cannot register a fleet of tenants through this endpoint, and weakening
+        the limit for a benchmark would measure a system that is not the one deployed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RegisterRequest'}
+      responses:
+        "201":
+          description: |
+            The account and its tenant were created. The body is a session, or — in the rare case
+            where the account was created but the initial login failed — a note instructing the
+            client to log in.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: '#/components/schemas/Session'}
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "429": {$ref: '#/components/responses/TooManyRequests'}
+        "500": {$ref: '#/components/responses/InternalError'}
+
+  /v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Exchange credentials for a session
+      operationId: login
+      description: |
+        Rate limited per address (PolicyLogin: 10 per minute) — the credential-stuffing surface.
+        A wrong password, an unknown address, and a malformed address all produce the same 401 and
+        take the same time, so the response cannot narrow a guess.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/LoginRequest'}
+      responses:
+        "200":
+          description: A new session.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: '#/components/schemas/Session'}
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "429": {$ref: '#/components/responses/TooManyRequests'}
+
+  /v1/auth/refresh:
+    post:
+      tags: [auth]
+      summary: Rotate a refresh token
+      operationId: refresh
+      description: |
+        Consumes the presented refresh token and issues a new pair. Presenting an already-consumed
+        token outside the grace window is treated as theft: the whole family is revoked and every
+        session in it stops working (ADR-012). The token travels in the body because the access
+        token may already be expired at the moment this is called.
+
+        Rate limited per address (PolicyRefreshIP: 20 per minute).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RefreshRequest'}
+      responses:
+        "200":
+          description: A rotated session.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: '#/components/schemas/Session'}
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "429": {$ref: '#/components/responses/TooManyRequests'}
+
+  /v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: End the session a refresh token belongs to
+      operationId: logout
+      description: |
+        Answers 204 whether or not the token was live, because the caller's intent is satisfied
+        either way and distinguishing the cases would tell an unauthenticated caller which tokens
+        exist. Deliberately not rate limited: it performs one indexed delete and is the endpoint a
+        client calls when it is already in trouble.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RefreshRequest'}
+      responses:
+        "204":
+          description: The session is over, or already was.
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+
+  /v1/me:
+    get:
+      tags: [auth]
+      summary: The authenticated principal
+      operationId: getMe
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      description: |
+        A pre-tenant endpoint: it answers "who am I and what may I do" and does not require a
+        tenant, because a person may belong to several.
+
+        The shape differs by credential, deliberately. A session reports `user_id` and a `tenants`
+        list, each entry carrying its own `permissions` — permissions come from a role in a
+        specific tenant, so a flat list would be wrong for exactly the users this endpoint serves.
+        An API key is bound to one tenant and reports `tenant_id` and a top-level `permissions`
+        list, which is what its scopes were at mint time. Neither credential ever receives the
+        other's permission model.
+      responses:
+        "200":
+          description: The principal.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: '#/components/schemas/Principal'}
+                required: [data]
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "429": {$ref: '#/components/responses/TooManyRequests'}
+
+  /v1/tenants:
+    get:
+      tags: [tenants]
+      summary: List the tenants the caller may act as
+      operationId: listTenants
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      description: |
+        For an API key this answers with the single tenant it belongs to, so a client written
+        against a session works unchanged with a key.
+      responses:
+        "200":
+          description: The caller's memberships.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: '#/components/schemas/TenantSummary'}
+                required: [data]
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "429": {$ref: '#/components/responses/TooManyRequests'}
+    post:
+      tags: [tenants]
+      summary: Create a tenant owned by the caller
+      operationId: createTenant
+      security:
+        - BearerAuth: []
+      description: |
+        The only place a membership is granted without an existing owner's approval, and it is
+        bounded: the membership is in the tenant being created. A machine credential cannot call
+        this — a key minting an organisation is exactly the unattended identity change the key
+        permission model forbids.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateTenantRequest'}
+      responses:
+        "201":
+          description: The new tenant.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: '#/components/schemas/TenantSummary'}
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "409": {$ref: '#/components/responses/Conflict'}
+
+  /v1/tenants/{tenantID}:
+    parameters:
+      - $ref: '#/components/parameters/TenantID'
+    get:
+      tags: [tenants]
+      summary: Read a tenant
+      operationId: getTenant
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: The tenant and the caller's role in it.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: '#/components/schemas/TenantDetail'}
+                required: [data]
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "429": {$ref: '#/components/responses/TooManyRequests'}
+
+  /v1/tenants/{tenantID}/members:
+    parameters:
+      - $ref: '#/components/parameters/TenantID'
+    get:
+      tags: [members]
+      summary: List members
+      operationId: listMembers
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: The roster.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: '#/components/schemas/Member'}
+                required: [data]
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+    post:
+      tags: [members]
+      summary: Grant an existing user a role
+      operationId: addMember
+      security:
+        - BearerAuth: []
+      description: |
+        Granting a role equal to your own is allowed; granting one above it is not, or an admin
+        could promote themselves by minting an owner. Not idempotency-guarded: a duplicate is
+        refused by the membership's primary key, so there is no second effect to prevent (ADR-004).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AddMemberRequest'}
+      responses:
+        "201":
+          description: The membership.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      user_id: {type: string, format: uuid}
+                      role: {type: string, enum: [owner, admin, member]}
+                    required: [user_id, role]
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "409": {$ref: '#/components/responses/Conflict'}
+
+  /v1/tenants/{tenantID}/audit:
+    parameters:
+      - $ref: '#/components/parameters/TenantID'
+    get:
+      tags: [audit]
+      summary: Read the audit trail, newest first
+      operationId: listAudit
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      description: |
+        Entries are written by the operations they describe, inside those operations' transactions,
+        and the table is append-only — enforced by a database trigger, not by convention (ADR-006).
+        There is no endpoint that creates, edits, or deletes an entry, and there should never be
+        one: a client that could write here could fabricate a history.
+
+        Requires `audit:read` (admin and owner, not member). The trail names who did what,
+        including API keys and request ids, so an admin who can rename a workspace is not
+        automatically able to enumerate its members' actions.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        "200":
+          description: One page of entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: '#/components/schemas/AuditEntry'}
+                  next_cursor: {type: string}
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+
+  /v1/tenants/{tenantID}/projects:
+    parameters:
+      - $ref: '#/components/parameters/TenantID'
+    get:
+      tags: [projects]
+      summary: List projects, newest first
+      operationId: listProjects
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      description: |
+        Keyset pagination over a signed `(created_at, id)` cursor (ADR-014). A cursor is bound to
+        the query that produced it — tenant, resource, and filters — so carrying one across a
+        filter change is a 400 that says so rather than a page that is quietly wrong.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: include_archived
+          in: query
+          required: false
+          schema: {type: boolean, default: false}
+      responses:
+        "200":
+          description: One page of projects.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: '#/components/schemas/Project'}
+                  next_cursor: {type: string}
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "429": {$ref: '#/components/responses/TooManyRequests'}
+    post:
+      tags: [projects]
+      summary: Create a project
+      operationId: createProject
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      description: |
+        Requires `project:write`. Attribution comes from the authorized principal, never the request
+        body: a human is recorded in `created_by`, a machine credential in `created_by_key`, and the
+        database enforces that exactly one is set.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProjectCreate'}
+      responses:
+        "201":
+          description: The created project. `Location` names it.
+          headers:
+            Location: {$ref: '#/components/headers/Location'}
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: '#/components/schemas/Project'}
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "409": {$ref: '#/components/responses/Conflict'}
+        "422": {$ref: '#/components/responses/IdempotencyMismatch'}
+
+  /v1/tenants/{tenantID}/projects/{projectID}:
+    parameters:
+      - $ref: '#/components/parameters/TenantID'
+      - $ref: '#/components/parameters/ProjectID'
+    get:
+      tags: [projects]
+      summary: Read a project
+      operationId: getProject
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: The project.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: '#/components/schemas/Project'}
+                required: [data]
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "404": {$ref: '#/components/responses/NotFound'}
+    patch:
+      tags: [projects]
+      summary: Update a project
+      operationId: updateProject
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      description: |
+        `expected_version` is required and has no default: an unguarded update is last-write-wins,
+        and the failure mode of guessing which edit survives is worse than a 409 that forces a
+        re-read.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProjectUpdate'}
+      responses:
+        "200":
+          description: The updated project.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: '#/components/schemas/Project'}
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "409": {$ref: '#/components/responses/VersionConflict'}
+    delete:
+      tags: [projects]
+      summary: Archive a project
+      operationId: archiveProject
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      description: |
+        Archived rather than deleted, so its audit trail and any references survive. The slug of an
+        archived project can be reused, because the uniqueness constraint is partial on
+        `archived_at IS NULL` — which is what archiving is for.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        "204":
+          description: The project is archived.
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+
+  /v1/tenants/{tenantID}/invoices:
+    parameters:
+      - $ref: '#/components/parameters/TenantID'
+    get:
+      tags: [invoices]
+      summary: List invoices, newest first
+      operationId: listInvoices
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        "200":
+          description: One page of invoices. Line items are omitted from listings.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: '#/components/schemas/Invoice'}
+                  next_cursor: {type: string}
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "404": {$ref: '#/components/responses/NotFound'}
+    post:
+      tags: [invoices]
+      summary: Create a draft invoice
+      operationId: createInvoice
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      description: |
+        Requires `invoice:write`. Amounts are integers in minor units and the totals are recomputed
+        by the server from the line items; the sum is checked for overflow as well as each line,
+        because the per-line limits permit a set of lines whose total does not fit in an int64
+        (ADR-008).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/InvoiceCreate'}
+      responses:
+        "201":
+          description: The created draft.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: '#/components/schemas/Invoice'}
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "422": {$ref: '#/components/responses/IdempotencyMismatch'}
+
+  /v1/tenants/{tenantID}/invoices/{invoiceID}:
+    parameters:
+      - $ref: '#/components/parameters/TenantID'
+      - $ref: '#/components/parameters/InvoiceID'
+    get:
+      tags: [invoices]
+      summary: Read an invoice
+      operationId: getInvoice
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: The invoice, with its line items.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: '#/components/schemas/Invoice'}
+                required: [data]
+        "401": {$ref: '#/components/responses/Unauthorized'}
+        "404": {$ref: '#/components/responses/NotFound'}
+
+  /v1/tenants/{tenantID}/invoices/{invoiceID}/items:
+    parameters:
+      - $ref: '#/components/parameters/TenantID'
+      - $ref: '#/components/parameters/InvoiceID'
+    post:
+      tags: [invoices]
+      summary: Add a line item
+      operationId: addInvoiceItem
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      description: |
+        Only a draft accepts items. The full invoice is returned rather than just the new line,
+        because adding a line changes the subtotal and total — a client that received only the item
+        would have to guess the new totals or re-read, which is the re-read the response can save.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/InvoiceItemCreate'}
+      responses:
+        "200":
+          description: The invoice with the new line and recomputed totals.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: '#/components/schemas/Invoice'}
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "409": {$ref: '#/components/responses/Conflict'}
+
+  /v1/tenants/{tenantID}/invoices/{invoiceID}/items/{itemID}:
+    parameters:
+      - $ref: '#/components/parameters/TenantID'
+      - $ref: '#/components/parameters/InvoiceID'
+      - $ref: '#/components/parameters/InvoiceItemID'
+    delete:
+      tags: [invoices]
+      summary: Remove a line item
+      operationId: removeInvoiceItem
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      description: Only a draft accepts removals. The full invoice is returned, totals recomputed.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        "200":
+          description: The invoice without the line and with recomputed totals.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: '#/components/schemas/Invoice'}
+                required: [data]
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "409": {$ref: '#/components/responses/Conflict'}
+
+  /v1/tenants/{tenantID}/invoices/{invoiceID}/issue:
+    parameters:
+      - $ref: '#/components/parameters/TenantID'
+      - $ref: '#/components/parameters/InvoiceID'
+    post:
+      tags: [invoices]
+      summary: Issue a draft
+      operationId: issueInvoice
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      description: |
+        Draft → open, guarded by compare-and-set on `expected_version`. Issuing freezes the
+        amounts: the invoice stops accepting item changes.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TransitionRequest'}
+      responses:
+        "200":
+          description: The open invoice.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: '#/components/schemas/Invoice'}
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "409": {$ref: '#/components/responses/VersionConflict'}
+
+  /v1/tenants/{tenantID}/invoices/{invoiceID}/pay:
+    parameters:
+      - $ref: '#/components/parameters/TenantID'
+      - $ref: '#/components/parameters/InvoiceID'
+    post:
+      tags: [invoices]
+      summary: Settle an open invoice
+      operationId: payInvoice
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      description: |
+        Open → paid. Requires `invoice:settle`, which is distinct from `invoice:write`: editing what
+        an invoice says is not the same act as declaring it paid, so a future role that can draft
+        but not settle is a permission change rather than a refactor. Settling twice is refused by
+        the version compare-and-set, not by a read-then-write.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TransitionRequest'}
+      responses:
+        "200":
+          description: The paid invoice.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: '#/components/schemas/Invoice'}
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "409": {$ref: '#/components/responses/VersionConflict'}
+
+  /v1/tenants/{tenantID}/invoices/{invoiceID}/void:
+    parameters:
+      - $ref: '#/components/parameters/TenantID'
+      - $ref: '#/components/parameters/InvoiceID'
+    post:
+      tags: [invoices]
+      summary: Void a draft or open invoice
+      operationId: voidInvoice
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      description: |
+        → void. Terminal: a voided invoice cannot be reopened, only replaced. Requires
+        `invoice:settle`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TransitionRequest'}
+      responses:
+        "200":
+          description: The voided invoice.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: '#/components/schemas/Invoice'}
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "409": {$ref: '#/components/responses/VersionConflict'}
+
+  /v1/tenants/{tenantID}/webhooks:
+    parameters:
+      - $ref: '#/components/parameters/TenantID'
+    get:
+      tags: [webhooks]
+      summary: List registered endpoints
+      operationId: listWebhookEndpoints
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      description: Requires `webhook:read`. Signing secrets are never in a listing.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        "200":
+          description: One page of endpoints.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: '#/components/schemas/WebhookEndpoint'}
+                  next_cursor: {type: string}
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+    post:
+      tags: [webhooks]
+      summary: Register a receiving endpoint
+      operationId: createWebhookEndpoint
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      description: |
+        Requires `webhook:manage`. The URL is resolved and validated at registration — refused if it
+        points at private space — and re-validated on every delivery, because a hostname can be
+        repointed after the registration check passed (ADR-013).
+
+        The signing secret is returned in this response and in no other. Like an API key, a secret
+        that can be read back is one that leaks from a list response, a log line, or a screenshot.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WebhookEndpointCreate'}
+      responses:
+        "201":
+          description: The endpoint, plus its secret — shown once.
+          headers:
+            Location: {$ref: '#/components/headers/Location'}
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    allOf:
+                      - $ref: '#/components/schemas/WebhookEndpoint'
+                      - type: object
+                        properties:
+                          secret:
+                            type: string
+                            description: The HMAC signing key. Shown exactly once.
+                        required: [secret]
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "500": {$ref: '#/components/responses/InternalError'}
+
+  /v1/tenants/{tenantID}/webhooks/{endpointID}:
+    parameters:
+      - $ref: '#/components/parameters/TenantID'
+      - $ref: '#/components/parameters/EndpointID'
+    get:
+      tags: [webhooks]
+      summary: Read an endpoint
+      operationId: getWebhookEndpoint
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: The endpoint. No secret.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: '#/components/schemas/WebhookEndpoint'}
+                required: [data]
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+    patch:
+      tags: [webhooks]
+      summary: Update an endpoint
+      operationId: updateWebhookEndpoint
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      description: |
+        Fields are optional; an omitted field is left alone. `{"active": false}` stops delivery
+        without discarding the history: deactivated, never deleted, because "we sent that and it
+        failed" is the fact an operator needs during an incident.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WebhookEndpointUpdate'}
+      responses:
+        "200":
+          description: The updated endpoint.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: '#/components/schemas/WebhookEndpoint'}
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+
+  /v1/tenants/{tenantID}/webhooks/{endpointID}/deliveries:
+    parameters:
+      - $ref: '#/components/parameters/TenantID'
+      - $ref: '#/components/parameters/EndpointID'
+    get:
+      tags: [webhooks]
+      summary: Delivery history for one endpoint
+      operationId: listWebhookDeliveries
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      description: |
+        "Why did this receiver not get event X" is always asked about one endpoint, so the route is
+        scoped to it — no filter the caller has to remember to apply, and one noisy receiver cannot
+        drown a listing that covers all of them. A wrong endpoint id is 404 rather than an empty
+        page, because an empty page reads as "no deliveries yet", which is a different answer.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: state
+          in: query
+          required: false
+          schema: {type: string, enum: [pending, delivering, delivered, dead]}
+      responses:
+        "200":
+          description: One page of deliveries.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: '#/components/schemas/WebhookDelivery'}
+                  next_cursor: {type: string}
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+
+  /v1/tenants/{tenantID}/webhooks/deliveries/{deliveryID}/replay:
+    parameters:
+      - $ref: '#/components/parameters/TenantID'
+      - $ref: '#/components/parameters/DeliveryID'
+    post:
+      tags: [webhooks]
+      summary: Re-queue a dead delivery
+      operationId: replayWebhookDelivery
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      description: |
+        Only a delivery in the DLQ (`dead`) can be replayed. Re-queuing a pending row would duplicate
+        an in-flight delivery, and re-queuing a delivered one would resend an event the receiver
+        already acknowledged — so this checks rather than trusts, and answers 409 for a delivery
+        that exists in the wrong state.
+
+        The stored payload is what gets sent. Rebuilding it from current state would deliver the
+        resource's *new* contents under the old event's name.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        "200":
+          description: The re-queued delivery.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: '#/components/schemas/WebhookDelivery'}
+                required: [data]
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+        "409": {$ref: '#/components/responses/Conflict'}
+
+  /v1/tenants/{tenantID}/api-keys:
+    parameters:
+      - $ref: '#/components/parameters/TenantID'
+    get:
+      tags: [api-keys]
+      summary: List machine credentials
+      operationId: listAPIKeys
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      description: |
+        Requires `apikey:read`, which is the one permission a machine credential may hold — a key
+        that can list its siblings is an observability convenience with no escalation path. Secrets
+        are never in a listing; the prefix is, so a row can be matched against the value configured
+        elsewhere.
+      responses:
+        "200":
+          description: The tenant's keys.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: '#/components/schemas/APIKey'}
+                required: [data]
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+    post:
+      tags: [api-keys]
+      summary: Mint a machine credential
+      operationId: createAPIKey
+      security:
+        - BearerAuth: []
+      description: |
+        Requires `apikey:manage`, which is human-only: a key that can mint keys survives its own
+        revocation by issuing a successor first. Scopes are validated at mint time against the
+        permission model — including the set a machine credential may never hold — so a typo is a
+        400 here rather than a key that silently authorizes nothing.
+
+        The secret is returned once. Nothing stores the plaintext, so a lost key is replaced rather
+        than recovered, and there is no endpoint that shows it again.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/APIKeyCreate'}
+      responses:
+        "201":
+          description: The key, plus its plaintext — shown once.
+          headers:
+            Location: {$ref: '#/components/headers/Location'}
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    allOf:
+                      - $ref: '#/components/schemas/APIKey'
+                      - type: object
+                        properties:
+                          secret:
+                            type: string
+                            description: The credential, prefixed `ak_`. Shown exactly once.
+                        required: [secret]
+                required: [data]
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+
+  /v1/tenants/{tenantID}/api-keys/{keyID}:
+    parameters:
+      - $ref: '#/components/parameters/TenantID'
+      - $ref: '#/components/parameters/APIKeyID'
+    delete:
+      tags: [api-keys]
+      summary: Revoke a machine credential
+      operationId: revokeAPIKey
+      security:
+        - BearerAuth: []
+      description: |
+        Requires `apikey:manage`. Answers 204 whether the key was live or already revoked, because
+        the caller's intent is satisfied either way and distinguishing the cases would turn the
+        endpoint into an enumeration oracle over key ids. A key belonging to another tenant is
+        indistinguishable from an unknown id — 404, never 403.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        "204":
+          description: The key is revoked, or already was.
+        "400": {$ref: '#/components/responses/ValidationFailed'}
+        "403": {$ref: '#/components/responses/Forbidden'}
+        "404": {$ref: '#/components/responses/NotFound'}
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        A session access token from `POST /v1/auth/login` or `POST /v1/auth/register`, presented as
+        `Authorization: Bearer <token>`. Short-lived, and carries identity only — authorization is
+        resolved per request, so a permission or membership change takes effect immediately
+        (ADR-012).
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: |
+        A machine credential minted at `POST /v1/tenants/{tenantID}/api-keys`, presented as
+        `Authorization: ApiKey <key>`. The key is bound to exactly one tenant and its scopes were
+        chosen at mint time. It cannot manage members, tenants, or keys.
+
+  parameters:
+    TenantID:
+      name: tenantID
+      in: path
+      required: true
+      description: The tenant's id. A caller who is not a member gets 404 — never 403.
+      schema: {type: string, format: uuid}
+    ProjectID:
+      name: projectID
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    InvoiceID:
+      name: invoiceID
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    InvoiceItemID:
+      name: itemID
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    EndpointID:
+      name: endpointID
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    DeliveryID:
+      name: deliveryID
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    APIKeyID:
+      name: keyID
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size. Values outside the supported range are clamped rather than refused.
+      schema: {type: integer, minimum: 1, maximum: 200}
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: |
+        An opaque cursor from a previous page's `next_cursor`. Signed and bound to the query that
+        produced it; reusing it against a different filter or tenant is a 400 naming the cause.
+      schema: {type: string}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Makes an unsafe write replay-safe: the first outcome is recorded under this key and replayed
+        for a retry with the same key and body, without applying the effect twice (ADR-004). Reusing
+        a key with a different body is 422; a concurrent retry of the same request is 409.
+      schema: {type: string, maxLength: 255}
+
+  headers:
+    Location:
+      description: The canonical URL of the created resource.
+      schema: {type: string}
+    RateLimitLimit:
+      description: The policy's limit for the current window.
+      schema: {type: integer}
+    RateLimitRemaining:
+      description: Requests left in the current window. Absent when the limiter is degraded.
+      schema: {type: integer}
+    RateLimitReset:
+      description: Seconds until the window resets.
+      schema: {type: integer}
+    RetryAfter:
+      description: Seconds until a request would be allowed again.
+      schema: {type: integer}
+
+  responses:
+    ValidationFailed:
+      description: |
+        The request failed validation. `error.code` is `validation_failed` and `error.details`
+        names the offending field, so a client can attach the message to an input rather than parse
+        prose.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    Unauthorized:
+      description: |
+        Authentication is required, or the credential is missing, expired, revoked, or forged. The
+        message is fixed — the client can act on none of those distinctions, and the specific reason
+        is what an attacker probing credentials wants to know.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    Forbidden:
+      description: |
+        The credential is valid but does not grant what the operation requires. Distinct from 404:
+        the caller is a member of this tenant and the resource is genuinely off-limits.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    NotFound:
+      description: |
+        The resource does not exist, or the caller may not know that it does. Cross-tenant access
+        and a malformed id both answer here, so nothing about existence or id format can be learned
+        from a status code.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    Conflict:
+      description: The request conflicts with the resource's current state.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    VersionConflict:
+      description: |
+        The resource changed since it was read. Re-read it and retry with the new
+        `expected_version`; this is the compare-and-set that stops two writers from silently
+        overwriting each other.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    IdempotencyMismatch:
+      description: |
+        The `Idempotency-Key` was reused with a different request body. Mint a new key rather than
+        reusing one whose outcome no longer corresponds to what is being sent.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    TooManyRequests:
+      description: The rate limit for this caller (address or tenant) is exhausted.
+      headers:
+        Retry-After: {$ref: '#/components/headers/RetryAfter'}
+        X-RateLimit-Limit: {$ref: '#/components/headers/RateLimitLimit'}
+        X-RateLimit-Reset: {$ref: '#/components/headers/RateLimitReset'}
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/ErrorEnvelope'
+            example:
+              error:
+                code: rate_limited
+                message: "too many requests; retry after the interval in Retry-After"
+    InternalError:
+      description: |
+        An unexpected failure. The message is generic by design; the specific cause is in the logs,
+        correlated by the `request_id` in the body and the `X-Request-Id` response header.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      description: The single error shape for the whole API.
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              description: A stable machine-readable code, e.g. `validation_failed`.
+            message:
+              type: string
+              description: Safe to show a client. Internal causes stay in the logs.
+            request_id:
+              type: string
+              description: Correlates this response with the log lines that produced it.
+            details:
+              type: object
+              additionalProperties: true
+              description: Structured, field-level detail where the code has any.
+          required: [code, message]
+      required: [error]
+
+    RegisterRequest:
+      type: object
+      properties:
+        email: {type: string, format: email}
+        password: {type: string, minLength: 1}
+        tenant_name:
+          type: string
+          description: The first tenant's name. Derived from the address when omitted.
+        tenant_slug: {type: string}
+      required: [email, password]
+
+    LoginRequest:
+      type: object
+      properties:
+        email: {type: string, format: email}
+        password: {type: string}
+      required: [email, password]
+
+    RefreshRequest:
+      type: object
+      properties:
+        refresh_token: {type: string}
+      required: [refresh_token]
+
+    CreateTenantRequest:
+      type: object
+      properties:
+        name: {type: string}
+        slug:
+          type: string
+          description: Derived from the name when omitted; uniqueness is enforced per service.
+      required: [name]
+
+    AddMemberRequest:
+      type: object
+      properties:
+        user_id: {type: string, format: uuid}
+        role: {type: string, enum: [owner, admin, member]}
+      required: [user_id, role]
+
+    Session:
+      type: object
+      description: An access/refresh pair plus the tenants the caller may act as.
+      properties:
+        access_token: {type: string}
+        refresh_token: {type: string}
+        token_type: {type: string, description: Always `Bearer`.}
+        expires_in:
+          type: integer
+          description: Seconds until the access token expires, per the OAuth 2 convention.
+        user_id: {type: string, format: uuid}
+        tenants:
+          type: array
+          items: {$ref: '#/components/schemas/TenantSummary'}
+      required: [access_token, refresh_token, token_type, expires_in, user_id, tenants]
+
+    TenantSummary:
+      type: object
+      properties:
+        tenant_id: {type: string, format: uuid}
+        slug: {type: string}
+        name: {type: string}
+        role: {type: string, enum: [owner, admin, member]}
+        permissions:
+          type: array
+          items: {type: string}
+          description: |
+            This role's permissions in this tenant. Present on the session's tenant list, omitted
+            from listings that carry no authorization context.
+      required: [tenant_id]
+
+    TenantDetail:
+      type: object
+      properties:
+        tenant_id: {type: string, format: uuid}
+        slug: {type: string}
+        name: {type: string}
+        role: {type: string, enum: [owner, admin, member]}
+        created_at: {type: string, format: date-time}
+      required: [tenant_id, slug, name, role, created_at]
+
+    Principal:
+      type: object
+      description: |
+        The response shape differs by credential: a session yields `user_id` plus a `tenants` list
+        carrying per-tenant permissions; an API key yields `tenant_id` plus one flat `permissions`
+        list.
+      properties:
+        auth_method: {type: string, enum: [jwt, api_key]}
+        user_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        permissions:
+          type: array
+          items: {type: string}
+        tenants:
+          type: array
+          items: {$ref: '#/components/schemas/TenantSummary'}
+      required: [auth_method]
+
+    Member:
+      type: object
+      properties:
+        user_id: {type: string, format: uuid}
+        email: {type: string, format: email}
+        role: {type: string, enum: [owner, admin, member]}
+        created_at: {type: string, format: date-time}
+      required: [user_id, email, role, created_at]
+
+    Project:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        name: {type: string}
+        slug: {type: string}
+        description: {type: string}
+        version:
+          type: integer
+          description: Bumped on every write; the `expected_version` of the next update.
+        created_by:
+          type: string
+          format: uuid
+          description: Set for human-created resources; absent for machine-created ones.
+        created_by_key:
+          type: string
+          format: uuid
+          description: Set for machine-created resources; absent for human-created ones.
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        archived_at: {type: string, format: date-time}
+      required: [id, tenant_id, name, slug, version, created_at, updated_at]
+
+    ProjectCreate:
+      type: object
+      properties:
+        name: {type: string}
+        slug: {type: string}
+        description: {type: string}
+      required: [name]
+
+    ProjectUpdate:
+      type: object
+      properties:
+        name: {type: string}
+        description: {type: string}
+        expected_version:
+          type: integer
+          description: Required. The `version` read before the change.
+      required: [expected_version]
+
+    Invoice:
+      type: object
+      description: |
+        Amounts are integers in minor units. `items` is present on single-resource responses and
+        omitted from listings.
+      properties:
+        id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        number: {type: string, description: Unique per tenant.}
+        status: {type: string, enum: [draft, open, paid, void]}
+        currency: {type: string, minLength: 3, maxLength: 3}
+        subtotal_minor: {type: integer, format: int64}
+        tax_minor: {type: integer, format: int64}
+        total_minor: {type: integer, format: int64}
+        version: {type: integer}
+        created_by: {type: string, format: uuid}
+        created_by_key: {type: string, format: uuid}
+        issued_at: {type: string, format: date-time}
+        paid_at: {type: string, format: date-time}
+        voided_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/InvoiceItem'}
+      required: [id, tenant_id, number, status, currency, subtotal_minor, tax_minor, total_minor, version, created_at, updated_at]
+
+    InvoiceItem:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        position: {type: integer}
+        description: {type: string}
+        quantity: {type: integer}
+        unit_price_minor: {type: integer, format: int64}
+        line_total_minor: {type: integer, format: int64}
+      required: [id, position, description, quantity, unit_price_minor, line_total_minor]
+
+    InvoiceCreate:
+      type: object
+      properties:
+        currency: {type: string, minLength: 3, maxLength: 3}
+        tax_minor: {type: integer, format: int64}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/InvoiceItemCreate'}
+      required: [currency]
+
+    InvoiceItemCreate:
+      type: object
+      properties:
+        description: {type: string}
+        quantity: {type: integer, minimum: 1}
+        unit_price_minor: {type: integer, format: int64}
+      required: [description, quantity, unit_price_minor]
+
+    TransitionRequest:
+      type: object
+      properties:
+        expected_version:
+          type: integer
+          description: Required. An unguarded transition is a last-write-wins write.
+      required: [expected_version]
+
+    WebhookEndpoint:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        url: {type: string, format: uri}
+        events:
+          type: array
+          items: {type: string}
+          description: The event names this receiver subscribes to.
+        description: {type: string}
+        active: {type: boolean}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+      required: [id, url, events, active, created_at, updated_at]
+
+    WebhookEndpointCreate:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+          description: |
+            Resolved and validated: a target in private or non-routable space is refused at
+            registration and again on every delivery attempt (ADR-013).
+        events:
+          type: array
+          items: {type: string}
+          minItems: 1
+          maxItems: 32
+        description: {type: string}
+      required: [url, events]
+
+    WebhookEndpointUpdate:
+      type: object
+      description: At least one field is required; omitted fields are left alone.
+      properties:
+        events:
+          type: array
+          items: {type: string}
+        description: {type: string}
+        active: {type: boolean}
+
+    WebhookDelivery:
+      type: object
+      description: |
+        One queued event. `state` is `pending` (due), `delivering` (leased), `delivered`
+        (acknowledged), or `dead` (attempts exhausted — replayable). The payload itself is not
+        listed; `last_error` and `last_status` are what a triage screen shows.
+      properties:
+        id: {type: string, format: uuid}
+        endpoint_id: {type: string, format: uuid}
+        event: {type: string}
+        state: {type: string, enum: [pending, delivering, delivered, dead]}
+        attempts: {type: integer}
+        replays: {type: integer}
+        next_at: {type: string, format: date-time}
+        last_error: {type: string}
+        last_status: {type: integer}
+        delivered_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+      required: [id, endpoint_id, event, state, attempts, replays, next_at, created_at]
+
+    APIKey:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        prefix: {type: string, description: The stored, non-secret part of the key.}
+        scopes:
+          type: array
+          items: {type: string}
+          description: The permissions chosen at mint time.
+        created_by: {type: string, format: uuid}
+        created_at: {type: string, format: date-time}
+        last_used_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+        revoked_at: {type: string, format: date-time}
+      required: [id, name, prefix, scopes, created_by, created_at]
+
+    APIKeyCreate:
+      type: object
+      properties:
+        name: {type: string, maxLength: 100}
+        scopes:
+          type: array
+          items: {type: string}
+          minItems: 1
+          description: |
+            Validated against the permission model. `apikey:manage`, `member:manage`, and
+            `tenant:manage` are refused outright: those are identity operations, and a key that can
+            perform them can outlive its own revocation.
+        expires_at: {type: string, format: date-time}
+      required: [name, scopes]
+
+    AuditEntry:
+      type: object
+      description: |
+        One recorded change. `before` and `after` are the fields the API exposes — never raw rows
+        and never secrets, because the table is append-only and cannot be pruned.
+      properties:
+        id: {type: string, format: uuid}
+        actor_kind: {type: string, enum: [user, api_key, system]}
+        actor_id:
+          type: string
+          format: uuid
+          description: Absent for a system actor, so "no actor" is distinguishable from "hidden".
+        action: {type: string, description: A dotted verb, e.g. `project.create`.}
+        resource: {type: string}
+        resource_id: {type: string, format: uuid}
+        before: {type: object, additionalProperties: true}
+        after: {type: object, additionalProperties: true}
+        request_id: {type: string}
+        at: {type: string, format: date-time}
+      required: [id, actor_kind, action, resource, at]

@@ -80,8 +80,11 @@ go test -race ./...
 - Statement coverage is 51.5% module-wide; the request-path packages carry it — `httpx` 76%,
   `project` 85%, `ratelimit` 89%, `ssrf` 84%. The wiring packages (`cmd/…`, `config`, `db`, `audit`)
   report 0% here because the compose smoke test exercises them as binaries, not through Go tests.
-- No test is skipped because a dependency is missing. A silently skipped isolation suite is worse
-  than a red build, so the suite fails and says why.
+- No test is skipped because a required dependency is missing: the suite fails and names the
+  variable to set. Silently skipping an isolation suite is worse than a red build. The one
+  conditional family is loud and by name — eighteen assertions verify the controls by reading the
+  database as the owner (the negative control for RLS, the append-only trigger, and the migration
+  runner) and skip with a reason when `TEST_MIGRATE_DATABASE_URL` is absent.
 - `.github/workflows/ci.yml` is the reference run: `gofmt`, `go vet`, the migrations, the full suite
   under `-race`, and `docker compose config`.
 - `scripts/smoke_compose.py` drives the deployed stack end to end: probes on both processes, a

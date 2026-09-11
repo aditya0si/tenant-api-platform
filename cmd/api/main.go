@@ -40,9 +40,11 @@ import (
 	"github.com/aditya0si/tenant-api-platform/internal/platform/cursor"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/db"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/logging"
+	"github.com/aditya0si/tenant-api-platform/internal/platform/ssrf"
 	"github.com/aditya0si/tenant-api-platform/internal/project"
 	"github.com/aditya0si/tenant-api-platform/internal/ratelimit"
 	"github.com/aditya0si/tenant-api-platform/internal/tenant"
+	"github.com/aditya0si/tenant-api-platform/internal/webhook"
 )
 
 // shutdownGrace bounds in-flight requests during shutdown.
@@ -86,7 +88,13 @@ func run() error {
 	// operator to have provisioned the right role, the service checks and refuses
 	// to start — a deployment that runs with isolation disabled is worse than one
 	// that refuses to boot, because nothing about it looks wrong.
-	if err := assertUnprivilegedRole(ctx, pool); err != nil {
+	// The same check the API makes, from one shared definition.
+	//
+	// It lives in the db package rather than in cmd/api because both binaries need it, and because
+	// the worker needs it for a subtler reason: this process reaches across every tenant by policy
+	// (app.worker, migration 0011), so a privileged worker would still deliver everything while
+	// bypassing the mechanism that bounds it. The constraint would look satisfied and would not be.
+	if err := db.AssertUnprivilegedRole(ctx, pool, log); err != nil {
 		return err
 	}
 
@@ -147,7 +155,18 @@ func run() error {
 	tenants := tenant.NewStore(pool)
 	projects := project.NewStore(pool)
 	auditReader := audit.NewReader(pool)
-	invoices := invoice.NewStore(pool)
+
+	// Constructed before the invoice store, which emits through it. The order is the direction the
+	// data flows: an invoice mutation writes an outbox row, so the outbox store is a dependency of
+	// the invoice store and the wiring reads that way rather than backwards.
+	webhooks := webhook.NewStore(pool)
+	invoices := invoice.NewStore(pool, webhooks)
+
+	// SSRF protection is constructed, never configured. A tenant supplies the delivery URL, so the
+	// guard is what stands between a registered endpoint and the cloud metadata service; making it
+	// switchable would mean the setting an operator flips to make a failing delivery work is the one
+	// that disables the protection.
+	ssrfGuard := ssrf.New()
 
 	// Idempotency retention and lease are deliberately not configurable.
 	//
@@ -180,6 +199,8 @@ func run() error {
 		Tenants:        tenants,
 		Projects:       projects,
 		Invoices:       invoices,
+		Webhooks:       webhooks,
+		SSRF:           ssrfGuard,
 		Cursors:        codec,
 		Audit:          auditReader,
 		Idempotency:    idempotencyStore,
@@ -227,53 +248,11 @@ func run() error {
 	return nil
 }
 
-// assertUnprivilegedRole refuses to start when the database connection can bypass
-// row-level security.
+// assertUnprivilegedRole was here and now lives in internal/platform/db/role.go.
 //
-// The check is enforced rather than documented because the failure is invisible:
-// every query still works, every application-level test still passes, and the only
-// thing lost is the second layer of tenant isolation — which is the layer that
-// holds when a query forgets its predicate. A service that boots with that layer
-// disabled looks entirely healthy.
-//
-// The escape hatch is an explicit environment variable rather than a permissive
-// default, so running without isolation is a decision someone records.
-func assertUnprivilegedRole(ctx context.Context, pool *pgxpool.Pool) error {
-	if os.Getenv("ALLOW_PRIVILEGED_DB_ROLE") == "1" {
-		slog.Default().Warn("starting with a privileged database role: row-level security is NOT enforced; " +
-			"this is only appropriate for a local debugging session")
-		return nil
-	}
-
-	var (
-		currentUser string
-		isSuper     bool
-		bypassRLS   bool
-	)
-	err := pool.QueryRow(ctx, `
-		SELECT current_user,
-		       (SELECT rolsuper      FROM pg_roles WHERE rolname = current_user),
-		       (SELECT rolbypassrls  FROM pg_roles WHERE rolname = current_user)`).
-		Scan(&currentUser, &isSuper, &bypassRLS)
-	if err != nil {
-		return fmt.Errorf("inspect database role: %w", err)
-	}
-
-	switch {
-	case isSuper:
-		return fmt.Errorf(
-			"database role %q is a SUPERUSER: superusers bypass row-level security unconditionally, "+
-				"so every tenant policy would be decorative. Point DATABASE_URL at the application role "+
-				"(app_rw, created by the migrations) and keep the owner credentials in MIGRATE_DATABASE_URL. "+
-				"Set ALLOW_PRIVILEGED_DB_ROLE=1 to start anyway, for local debugging only", currentUser)
-	case bypassRLS:
-		return fmt.Errorf(
-			"database role %q has BYPASSRLS: it ignores row-level security, so tenant isolation would "+
-				"not be enforced by the database. Use the application role (app_rw). "+
-				"Set ALLOW_PRIVILEGED_DB_ROLE=1 to start anyway, for local debugging only", currentUser)
-	}
-	return nil
-}
+// It moved because cmd/worker needs the identical check, and two copies of a security assertion
+// drift: the one that gets fixed is the one somebody remembered, and the other silently keeps
+// permitting the thing it was written to prevent. One definition, called by both binaries.
 
 // pingFunc adapts the pool to the readiness probe signature.
 func pingFunc(pool *pgxpool.Pool) func(r *http.Request) bool {

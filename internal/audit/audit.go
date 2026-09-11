@@ -69,6 +69,14 @@ const (
 	ActionInvoiceIssued      = "invoice.issued"
 	ActionInvoicePaid        = "invoice.paid"
 	ActionInvoiceVoided      = "invoice.voided"
+
+	// Webhook actions. Registration and its modification are recorded because they change where a
+	// tenant's data is sent — which is a security-relevant fact, not an administrative one. A
+	// replay is recorded for the same reason: re-sending an event the receiver already saw is an
+	// action somebody should be able to account for.
+	ActionWebhookEndpointCreate = "webhook_endpoint.create"
+	ActionWebhookEndpointUpdate = "webhook_endpoint.update"
+	ActionWebhookDeliveryReplay = "webhook_delivery.replay"
 )
 
 // Entry is one audit record.

@@ -13,7 +13,7 @@ Single-repo Project 1. Project 2 (streaming) starts only after this ships with b
 1. Orgs/tenants, users, memberships, roles `owner > admin > member`, RBAC permission map in code.
 2. Auth: password (argon2id) + short-lived JWT access (10m) + opaque refresh family with rotation + reuse detection; API keys (`ak_` prefix, SHA-256 stored).
 3. Projects CRUD, tenant-scoped. Invoices: line items, totals in minor units, state machine `draft → open → paid | void` with compare-and-set + append-only events.
-4. Cross-cutting: cursor pagination, idempotency keys on unsafe methods, distributed rate limiting, audit log, webhooks via transactional outbox + retries + DLQ + replay + SSRF guard, OpenAPI with contract test, structured logs/metrics/traces, health/readiness.
+4. Cross-cutting: cursor pagination, idempotency keys on unsafe methods, distributed rate limiting, audit log, webhooks via transactional outbox + retries + DLQ + replay + SSRF guard, OpenAPI with contract test (spec and contract test pending; see ADR-010), structured logs/metrics/traces, health/readiness.
 5. Ops: `docker compose up` from fresh clone; seed; migrate; CI green; k6-measured numbers.
 
 Non-requirements: no payments/PSP, no multi-region, no blue/green, no DB-driven policy engine, no NATS/Kafka in P1, no AI features, no microservices.
@@ -88,11 +88,12 @@ Cursor: base64url `{ts, id, sig}` where `sig = HMAC(secret, ts.id)`; predicate `
 - ADR-003 TenantScope-in-code primary + RLS defense (incl. FORCE RLS, SET LOCAL, 404-not-403).
 - ADR-004 Idempotency DB-primary, Redis lock only (durable, tx-coupled).
 - ADR-005 Redis Lua single-key rate limit, fail-open on Redis down (rejected fixed window).
-- ADR-006 Cursor `(created_at,id)` HMAC-signed (rejected offset, id-only cursor).
+- ADR-006 The audit log is append-only, written inside the transaction it describes.
 - ADR-007 UUIDv7 PKs (rejected v4/bigserial: locality + no leakage).
 - ADR-008 Money int64 minor + currency code (rejected float).
 - ADR-009 Static role→perm map (rejected DB policy engine as over-engineering).
-- ADR-010 chi + hand-written OpenAPI + contract test (rejected huma: reviewer must see spec authorship).
-- ADR-011 goose embedded, explicit migrate step (rejected auto-migrate-on-boot for prod).
+- ADR-010 chi + hand-written OpenAPI + contract test (rejected huma: reviewer must see spec authorship; spec text still pending).
+- ADR-011 Forward-only embedded migrations, applied explicitly (rejected goose/golang-migrate: their own history tables, their own locking, an extra adapter).
 - ADR-012 Short-TTL JWT + refresh-family revocation, no denylist.
 - ADR-013 Webhook SSRF guard + timestamped signatures + traceparent in outbox.
+- ADR-014 Keyset pagination with signed, query-bound cursors (rejected offset: wrong on live data and O(depth)).

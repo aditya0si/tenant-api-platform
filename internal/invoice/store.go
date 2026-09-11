@@ -16,6 +16,7 @@ import (
 	"github.com/aditya0si/tenant-api-platform/internal/platform/db"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/reqid"
 	"github.com/aditya0si/tenant-api-platform/internal/tenant"
+	"github.com/aditya0si/tenant-api-platform/internal/webhook"
 )
 
 // Store is the invoice repository.
@@ -24,10 +25,91 @@ import (
 // having authorized first, and the queries are additionally bounded by row-level security.
 type Store struct {
 	pool *pgxpool.Pool
+
+	// events records what happened, for delivery to the tenant's webhook endpoints.
+	//
+	// It is enqueued *inside* the transaction that changes the invoice, which is the whole reason
+	// the outbox exists: an event written after commit is lost to a crash in the gap, and one
+	// written before a rollback announces a change that never happened. Neither is fixable in a
+	// transport layer, which cannot join a transaction it did not open — the same argument as the
+	// audit trail, and the reason both are called from here rather than from a middleware.
+	//
+	// Nil disables delivery and is what the pure unit tests use; production always supplies one.
+	events *webhook.Store
 }
 
-// NewStore builds a store.
-func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
+// NewStore builds a store. events may be nil, which emits nothing.
+func NewStore(pool *pgxpool.Pool, events *webhook.Store) *Store {
+	return &Store{pool: pool, events: events}
+}
+
+// emit records a domain event for delivery, in the caller's transaction.
+//
+// A failure is returned rather than logged and swallowed. Swallowing it would commit the invoice
+// while losing the notification, which is the half-delivered state the outbox is designed to make
+// impossible — the tenant's receiver would never learn, and nothing would record that it should
+// have. Failing the request is the honest outcome: the client retries, and if the retry carries an
+// idempotency key the work is not duplicated.
+func (s *Store) emit(ctx context.Context, tx pgx.Tx, auth tenant.Authorized, event string, inv Invoice) error {
+	if s.events == nil {
+		return nil
+	}
+	if _, err := s.events.Enqueue(ctx, tx, auth.Scope().ID(), event, eventPayload(inv)); err != nil {
+		return fmt.Errorf("invoice: enqueue %s: %w", event, err)
+	}
+	return nil
+}
+
+// eventPayload is what a receiver receives as the event's data.
+//
+// It is not the same projection as auditImage: the audit trail records that a change happened and
+// to which fields, while a receiver has to act on it — an invoice.paid delivery with no line items
+// would leave the integration fetching the invoice back, which is a second request that the
+// payload could have made unnecessary.
+//
+// Amounts stay integers in minor units, matching the API and the schema. A receiver that wants
+// "$12.34" formats it; one that needs to add it up cannot use a formatted string.
+func eventPayload(inv Invoice) map[string]any {
+	items := make([]map[string]any, 0, len(inv.Items))
+	for _, it := range inv.Items {
+		items = append(items, map[string]any{
+			"description":      it.Description,
+			"quantity":         it.Quantity,
+			"unit_price_minor": it.UnitPriceMinor,
+			"line_total_minor": it.LineTotalMinor,
+		})
+	}
+	return map[string]any{
+		"id":             inv.ID.String(),
+		"number":         inv.Number,
+		"status":         inv.Status,
+		"currency":       inv.Currency,
+		"subtotal_minor": inv.SubtotalMinor,
+		"tax_minor":      inv.TaxMinor,
+		"total_minor":    inv.TotalMinor,
+		"version":        inv.Version,
+		"items":          items,
+	}
+}
+
+// eventForTransition maps a lifecycle transition onto the event it emits.
+//
+// The mapping is exhaustive over the three transitions and returns "" for anything else, so a new
+// transition added without an event fails the emit rather than silently notifying nobody — a
+// webhook that never fires is indistinguishable from a receiver that never received, which is the
+// hardest kind of integration bug to notice.
+func eventForTransition(t Transition) string {
+	switch t {
+	case TransitionIssue:
+		return webhook.EventInvoiceIssued
+	case TransitionPay:
+		return webhook.EventInvoicePaid
+	case TransitionVoid:
+		return webhook.EventInvoiceVoided
+	default:
+		return ""
+	}
+}
 
 // invoiceColumns is the projection every read uses, so a scan and its query cannot drift.
 const invoiceColumns = `id, tenant_id, number, status, currency,
@@ -261,6 +343,10 @@ func (s *Store) Create(ctx context.Context, auth tenant.Authorized, in CreateInp
 		// is to be replayable. Migration 0009 exists because 0008 required the opposite.
 		draft := StatusDraft
 		if err := writeEvent(ctx, tx, auth, inv, "created", nil, &draft); err != nil {
+			return err
+		}
+		// Enqueued inside this transaction, so the invoice and its notification commit together.
+		if err := s.emit(ctx, tx, auth, webhook.EventInvoiceCreated, inv); err != nil {
 			return err
 		}
 		return auditInvoice(ctx, tx, auth, audit.ActionInvoiceCreate, inv, nil, auditImage(inv))
@@ -681,6 +767,16 @@ func (s *Store) Transition(ctx context.Context, auth tenant.Authorized, id uuid.
 
 		from := before.Status
 		if err := writeEvent(ctx, tx, auth, updated, string(t), &from, &to); err != nil {
+			return err
+		}
+		// The event and the transition commit together. A payment announced but rolled back is a
+		// receiver shipping goods for an invoice that was never settled.
+		event := eventForTransition(t)
+		if event == "" {
+			return fmt.Errorf("invoice: transition %q has no event mapped, so this change would "+
+				"notify nobody", t)
+		}
+		if err := s.emit(ctx, tx, auth, event, updated); err != nil {
 			return err
 		}
 		if err := auditInvoice(ctx, tx, auth, auditActionFor(t), updated, auditImage(before), auditImage(updated)); err != nil {

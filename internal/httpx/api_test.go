@@ -35,9 +35,11 @@ import (
 	"github.com/aditya0si/tenant-api-platform/internal/idempotency"
 	"github.com/aditya0si/tenant-api-platform/internal/invoice"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/cursor"
+	"github.com/aditya0si/tenant-api-platform/internal/platform/ssrf"
 	"github.com/aditya0si/tenant-api-platform/internal/project"
 	"github.com/aditya0si/tenant-api-platform/internal/tenant"
 	"github.com/aditya0si/tenant-api-platform/internal/testsupport"
+	"github.com/aditya0si/tenant-api-platform/internal/webhook"
 )
 
 // testSecret is the signing key every server in this file uses. It is 32 bytes
@@ -118,7 +120,17 @@ func newServerWith(t *testing.T, cfg serverConfig) *server {
 	// the same SQL that runs in production.
 	idem := idempotency.NewStore(d.App, 0, 0)
 	auditReader := audit.NewReader(d.App)
-	invoiceStore := invoice.NewStore(d.App)
+	// The real webhook store, so an invoice mutation enqueues through the same code production
+	// uses — the outbox row is written inside the invoice's transaction, and a stub here would
+	// test the stub rather than the atomicity.
+	webhookStore := webhook.NewStore(d.App)
+	invoiceStore := invoice.NewStore(d.App, webhookStore)
+
+	// The SSRF guard in its tests-only form, which permits loopback so a test can point an endpoint
+	// at an httptest server. Production constructs the guard with the default constructor and no
+	// loopback exception; the difference is a named constructor rather than a flag so the two are
+	// distinguishable at a call site.
+	ssrfGuard := ssrf.NewForTests(nil)
 
 	svc, err := authn.NewService(
 		users, tokens,
@@ -140,6 +152,8 @@ func newServerWith(t *testing.T, cfg serverConfig) *server {
 		Cursors:        codec,
 		Audit:          auditReader,
 		Invoices:       invoiceStore,
+		Webhooks:       webhookStore,
+		SSRF:           ssrfGuard,
 		Idempotency:    idem,
 		RateLimits:     cfg.rateLimits,
 		AccessTokenTTL: 600,

@@ -18,8 +18,10 @@ import (
 	"github.com/aditya0si/tenant-api-platform/internal/platform/cursor"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/httperr"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/metrics"
+	"github.com/aditya0si/tenant-api-platform/internal/platform/ssrf"
 	"github.com/aditya0si/tenant-api-platform/internal/project"
 	"github.com/aditya0si/tenant-api-platform/internal/tenant"
+	"github.com/aditya0si/tenant-api-platform/internal/webhook"
 )
 
 // Deps are the collaborators the HTTP layer needs.
@@ -48,6 +50,15 @@ type Deps struct {
 	// rather than existing and panicking inside a nil store, which is what happened before
 	// registerInvoiceRoutes checked. See its comment.
 	Invoices *invoice.Store
+
+	// Webhooks owns endpoint registration and the delivery history. Nil disables those routes,
+	// for the same reason as Invoices.
+	Webhooks *webhook.Store
+
+	// SSRF validates tenant-supplied delivery targets. Nil makes registration refuse rather
+	// than skip the check: a tenant-supplied URL with nothing validating it is a request to
+	// whatever address they name, including the cloud metadata service.
+	SSRF *ssrf.Guard
 
 	// Audit reads the append-only trail. There is deliberately no writer here: entries are
 	// recorded by the operations they describe, inside those operations' transactions, so
@@ -118,6 +129,43 @@ func registerInvoiceRoutes(r chi.Router, d Deps) {
 	})
 }
 
+// registerWebhookRoutes attaches the webhook surface, if this deployment has it.
+//
+// Same shape as registerInvoiceRoutes and for the same reason: a router assembled without the
+// store gets no endpoints rather than endpoints that panic inside a nil receiver.
+//
+// # Permission split
+//
+// Reads need webhook:read. Creating or changing an endpoint needs webhook:manage, and so does a
+// replay — all three are writes, and the first two change where a tenant's data is sent, which is
+// a security-relevant act rather than an administrative one. A member who can read a workspace has
+// no business repointing its deliveries at a URL they chose.
+func registerWebhookRoutes(r chi.Router, d Deps) {
+	if d.Webhooks == nil {
+		return
+	}
+
+	r.Route("/webhooks", func(r chi.Router) {
+		r.With(authz.Require(authz.PermWebhookRead)).Get("/", d.handleListWebhookEndpoints)
+		r.With(authz.Require(authz.PermWebhookRead)).Get("/{endpointID}", d.handleGetWebhookEndpoint)
+		r.With(authz.Require(authz.PermWebhookRead)).Get("/{endpointID}/deliveries", d.handleListWebhookDeliveries)
+
+		// Registration and modification are guarded writes: authorization, then idempotency. The
+		// ordering matters as much here as anywhere — an unauthorized caller must not be able to
+		// claim an idempotency row by probing, and a retried registration must not create a second
+		// endpoint pointing at the same URL with a different secret.
+		r.Group(func(r chi.Router) {
+			r.Use(writeGuard(string(authz.PermWebhookManage), d.Idempotency, d.Log))
+			r.Post("/", d.handleCreateWebhookEndpoint)
+			r.Patch("/{endpointID}", d.handleUpdateWebhookEndpoint)
+			// Replay is a POST that re-queues an existing row. It is guarded because a client
+			// retrying it after a lost response would otherwise reset the attempt count again and
+			// make the delivery history unreadable.
+			r.Post("/deliveries/{deliveryID}/replay", d.handleReplayWebhookDelivery)
+		})
+	})
+}
+
 // requirePerm is the authorization middleware as a plain function, so a composition like
 // writeGuard can apply it without going through chi's With().
 func requirePerm(perm string) func(http.Handler) http.Handler {
@@ -151,6 +199,9 @@ func New(d Deps) http.Handler {
 	// than as a bare connection close.
 	r.Use(middleware.RequestID)
 	r.Use(requestIDResponseHeader)
+	// After RequestID so a trace id and a request id are both available to anything downstream,
+	// and before the handlers so an outbox row written by one carries the caller's context.
+	r.Use(traceContext)
 	// middleware.RealIP is deliberately absent.
 	//
 	// It rewrites RemoteAddr from X-Forwarded-For unconditionally, which is correct only when
@@ -243,6 +294,7 @@ func New(d Deps) http.Handler {
 		r.With(authz.Require(authz.PermAuditRead)).Get("/audit", d.handleListAudit)
 
 		registerInvoiceRoutes(r, d)
+		registerWebhookRoutes(r, d)
 
 		r.Route("/projects", func(r chi.Router) {
 			// Reads are safe, so they need only the read permission — and deliberately no

@@ -59,6 +59,18 @@ type Config struct {
 	// those proxies.
 	TrustedProxyCIDRs []string
 
+	// WorkerBatchSize and WorkerInterval configure the webhook worker. Both are in the shared
+	// config because cmd/worker calls Load like the API does — one loader for both binaries, so a
+	// value cannot be spelled one way in one process and another way in the other.
+	//
+	// They are tunable where the idempotency lease and retention deliberately are not: batch size
+	// and poll interval have no correctness coupling. A wrong lease causes duplicate deliveries; a
+	// wrong interval only changes latency, and an operator sizing a deployment against a real
+	// backlog needs that knob.
+	WorkerBatchSize   int
+	WorkerInterval    time.Duration
+	WorkerMetricsPort int
+
 	LogLevel string
 }
 
@@ -124,6 +136,28 @@ func Load() (Config, error) {
 	}
 	if c.RefreshReuseGrace, err = durationEnv("REFRESH_REUSE_GRACE", 10*time.Second); err != nil {
 		return Config{}, err
+	}
+
+	if c.WorkerBatchSize, err = intEnv("WORKER_BATCH_SIZE", 10); err != nil {
+		return Config{}, err
+	}
+	if c.WorkerBatchSize <= 0 || c.WorkerBatchSize > 1000 {
+		// Bounded because a batch is held for as long as its deliveries take: a thousand-row batch
+		// against a slow receiver holds connections and locks for minutes, and the poll would have
+		// achieved the same throughput in smaller pieces.
+		return Config{}, fmt.Errorf("config: WORKER_BATCH_SIZE must be between 1 and 1000, got %d", c.WorkerBatchSize)
+	}
+	if c.WorkerInterval, err = durationEnv("WORKER_INTERVAL", time.Second); err != nil {
+		return Config{}, err
+	}
+	if c.WorkerInterval <= 0 {
+		return Config{}, fmt.Errorf("config: WORKER_INTERVAL must be positive, got %s", c.WorkerInterval)
+	}
+	if c.WorkerMetricsPort, err = intEnv("WORKER_METRICS_PORT", 9090); err != nil {
+		return Config{}, err
+	}
+	if c.WorkerMetricsPort <= 0 || c.WorkerMetricsPort > 65535 {
+		return Config{}, fmt.Errorf("config: WORKER_METRICS_PORT must be between 1 and 65535, got %d", c.WorkerMetricsPort)
 	}
 
 	if c.AccessTokenTTL > time.Hour {

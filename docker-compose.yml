@@ -73,6 +73,48 @@ services:
       migrate:
         condition: service_completed_successfully
 
+  # Delivers webhook events from the outbox.
+  #
+  # This service is not optional, and its absence is the failure worth naming: without it the
+  # API accepts endpoint registrations, enqueues deliveries inside its transactions, and
+  # nothing ever sends them. The system would look entirely healthy — registrations succeed,
+  # the delivery history fills with `pending` rows — while every tenant's integration silently
+  # received nothing. A half-feature that reports success is worse than a missing one.
+  #
+  # It runs the same image as the API with a different entrypoint, so the two cannot drift to
+  # different builds of the same commit.
+  worker:
+    build: .
+    container_name: tap-worker
+    entrypoint: ["/bin/worker"]
+    ports:
+      # Metrics and health on their own port. Published for local development so the depth
+      # gauge is readable; in production this listener stays on the internal network, because
+      # the outbox depth is operational data about every tenant's delivery backlog.
+      - "9090:9090"
+    environment:
+      DATABASE_URL: postgres://app_rw:app_rw@postgres:5432/tenant_platform?sslmode=disable
+      WORKER_METRICS_PORT: "9090"
+      WORKER_BATCH_SIZE: "10"
+      WORKER_INTERVAL: 1s
+      LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # A healthcheck on the metrics listener, so `docker compose ps` distinguishes a worker
+    # that is delivering from one that exited. The endpoint checks the database, not just the
+    # process: a worker whose connection is gone cannot claim or settle anything, and
+    # reporting it healthy would hide a stalled queue.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:9090/readyz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
 volumes:
   pgdata:
   redisdata:

@@ -83,3 +83,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker compose config
+
+  # The stack is started and exercised, not just validated.
+  #
+  # `docker compose config` (above) proves the file parses. It cannot catch an entrypoint that
+  # exits, a container that cannot resolve a service name, or a control that is active in the test
+  # harness but not in the running binary. This job is that check: it builds the images, waits for
+  # both processes to report ready, then runs the same script a developer runs locally — covering
+  # registration, the rate-limit headers, an idempotent retry, the SSRF guard, tenant boundaries,
+  # and the metrics each process exposes.
+  #
+  # Worth its two minutes, because it has already found three defects the Go suite could not see:
+  # a refused webhook target answered 500 instead of 400, session responses omitted the
+  # permissions they document, and the worker's outbox-depth gauge was absent — not zero — for as
+  # long as the queue was empty.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: start the stack
+        run: docker compose up -d --build
+
+      - name: wait for both processes to be ready
+        run: |
+          for i in $(seq 1 60); do
+            api=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/readyz || true)
+            worker=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9090/readyz || true)
+            if [ "$api" = "200" ] && [ "$worker" = "200" ]; then
+              echo "api and worker are ready after ${i} attempt(s)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::the stack did not become ready within 120s"
+          docker compose ps
+          exit 1
+
+      - name: smoke test (the deployed path)
+        run: python3 scripts/smoke_compose.py
+
+      - name: stack logs
+        if: failure()
+        run: docker compose logs --no-color

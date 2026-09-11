@@ -86,7 +86,8 @@ go test -race ./...
   database as the owner (the negative control for RLS, the append-only trigger, and the migration
   runner) and skip with a reason when `TEST_MIGRATE_DATABASE_URL` is absent.
 - `.github/workflows/ci.yml` is the reference run: `gofmt`, `go vet`, the migrations, the full suite
-  under `-race`, and `docker compose config`.
+  under `-race`, `docker compose config`, and — in a third job — the deployed stack itself, started
+  and exercised by the smoke script below.
 - `scripts/smoke_compose.py` drives the deployed stack end to end: probes on both processes, a
   session, the rate-limit headers, an idempotent retry, the SSRF guard, tenant boundaries, and the
   metrics each process exposes. It runs against `docker compose up` and found three defects the Go
@@ -121,7 +122,16 @@ bounds this application's own overhead and says nothing about a distributed depl
 limiter was held at 70% of each tenant's ceiling (7 of 10 rps) so no request was throttled — the
 numbers measure the endpoints, not the limiter.
 
-Reproduce with `make load-seed && make load`.
+Reproduce with `make load-seed && make load` — or, where `make` is not installed, the two commands
+those targets run:
+
+```bash
+go run ./cmd/loadseed -tenants 30 -out load/sessions.json
+k6 run load/api.js
+```
+
+Seeding writes bearer tokens for the tenants it creates, so it is separate from the run: the
+sessions expire with the access-token TTL, and `load/sessions.json` stays out of git.
 
 ## Decisions worth arguing about
 

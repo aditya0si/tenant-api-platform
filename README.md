@@ -75,12 +75,19 @@ export TEST_REDIS_URL='redis://localhost:6379/1'
 go test -race ./...
 ```
 
-- 297 test functions across 15 packages, against a real Postgres and a real Redis — the isolation
+- 304 test functions across 15 packages, against a real Postgres and a real Redis — the isolation
   tests measure the policies Postgres actually applies, not a fake.
 - No test is skipped because a dependency is missing. A silently skipped isolation suite is worse
   than a red build, so the suite fails and says why.
 - `.github/workflows/ci.yml` is the reference run: `gofmt`, `go vet`, the migrations, the full suite
   under `-race`, and `docker compose config`.
+- `scripts/smoke_compose.py` drives the deployed stack end to end: probes on both processes, a
+  session, the rate-limit headers, an idempotent retry, the SSRF guard, tenant boundaries, and the
+  metrics each process exposes. It runs against `docker compose up` and found three defects the Go
+  suite did not — a blocked webhook target answered 500 instead of 400, session responses carried
+  no permissions, and the worker's outbox-depth gauge did not exist while the queue was empty.
+  Its tests are the regression tests for those; the script is what proves the wiring in the
+  deployed binary.
 
 ## Measured, not asserted
 

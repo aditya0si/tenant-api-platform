@@ -3,6 +3,7 @@ package httpx
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/aditya0si/tenant-api-platform/internal/platform/apperr"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/cursor"
@@ -141,7 +142,12 @@ func (d Deps) handleCreateWebhookEndpoint(w http.ResponseWriter, r *http.Request
 	// looking at the form. Delivery re-validates regardless — a name can be repointed afterwards,
 	// and the registration check is an early warning rather than a standing permission.
 	if err := d.SSRF.ValidateEndpointURL(validated.URL); err != nil {
-		httperr.Fail(w, r, d.Log, err)
+		// A refused destination is the tenant's input, not a failure of this service. Passed
+		// unclassified it becomes a 500, which tells a client to retry a request that can never
+		// succeed — and it hides the reason, which is the only part the tenant can act on. The
+		// guard's message names the address and why it was refused, so it is passed through with
+		// its package prefix trimmed.
+		httperr.Fail(w, r, d.Log, apperr.Invalid("url", strings.TrimPrefix(err.Error(), "ssrf: ")))
 		return
 	}
 

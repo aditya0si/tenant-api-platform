@@ -495,14 +495,20 @@ func shortRandomSuffix() string {
 // computes its own refresh point from its own clock. A server timestamp would require
 // the two clocks to agree, and a browser whose clock is off is the normal case, not
 // the exceptional one.
+//
+// Each tenant entry carries the permissions that role holds *in that tenant*, resolved from the
+// static permission map rather than fetched. /v1/me reports the same field for the same reason, and
+// the two must agree: a client that caches what login told it would otherwise hold a permission
+// list that no endpoint confirms.
 func sessionResponseFrom(s authn.Session, ttlSeconds int) sessionResponse {
 	tenants := make([]tenantSummary, 0, len(s.Tenants))
 	for _, t := range s.Tenants {
 		tenants = append(tenants, tenantSummary{
-			TenantID: t.TenantID.String(),
-			Slug:     t.Slug,
-			Name:     t.Name,
-			Role:     string(t.Role),
+			TenantID:    t.TenantID.String(),
+			Slug:        t.Slug,
+			Name:        t.Name,
+			Role:        string(t.Role),
+			Permissions: rolePermStrings(t.Role),
 		})
 	}
 	return sessionResponse{

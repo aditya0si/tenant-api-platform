@@ -480,7 +480,11 @@ func (s *Store) Replay(ctx context.Context, auth tenant.Authorized, id uuid.UUID
 // It is the gauge an operator watches: a rising pending count means receivers are failing or the
 // worker is not keeping up, and the two are distinguished by the dead count rising separately.
 func (s *Store) Depth(ctx context.Context) (map[string]int, error) {
-	out := map[string]int{}
+	// Initialised with every undelivered state rather than only those that have rows. The worker
+	// builds its gauge from this map, and a GROUP BY over an empty table returns no rows — so the
+	// one health signal the worker has did not exist precisely when the queue was healthy, and an
+	// alert on its absence would fire on a quiet system while a stalled one looked identical.
+	out := map[string]int{StatePending: 0, StateDelivering: 0, StateDead: 0}
 	err := db.WithSettings(ctx, s.pool, map[string]string{SettingWorker: "true"}, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx,
 			`SELECT state, count(*) FROM webhook_outbox WHERE state <> 'delivered' GROUP BY state`)

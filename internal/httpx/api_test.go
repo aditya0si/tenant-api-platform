@@ -300,6 +300,10 @@ type sessionBody struct {
 		Slug     string `json:"slug"`
 		Name     string `json:"name"`
 		Role     string `json:"role"`
+		// Permissions is per-tenant and present on the wire, so the harness carries it too: a struct
+		// that silently dropped it would make a test asserting on the field decode an empty list and
+		// pass, which is the exact bug this field was added to the API to fix.
+		Permissions []string `json:"permissions"`
 	} `json:"tenants"`
 }
 

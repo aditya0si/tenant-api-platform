@@ -75,7 +75,7 @@ export TEST_REDIS_URL='redis://localhost:6379/1'
 go test -race ./...
 ```
 
-- 289 test functions across 15 packages, against a real Postgres and a real Redis — the isolation
+- 297 test functions across 15 packages, against a real Postgres and a real Redis — the isolation
   tests measure the policies Postgres actually applies, not a fake.
 - No test is skipped because a dependency is missing. A silently skipped isolation suite is worse
   than a red build, so the suite fails and says why.

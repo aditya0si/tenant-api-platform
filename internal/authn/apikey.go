@@ -13,9 +13,11 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/aditya0si/tenant-api-platform/internal/audit"
 	"github.com/aditya0si/tenant-api-platform/internal/authz"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/apperr"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/db"
+	"github.com/aditya0si/tenant-api-platform/internal/platform/reqid"
 )
 
 const (
@@ -74,6 +76,27 @@ type APIKeyStore struct {
 // NewAPIKeyStore builds a store.
 func NewAPIKeyStore(pool *pgxpool.Pool) *APIKeyStore {
 	return &APIKeyStore{pool: pool, now: time.Now}
+}
+
+// apiKeyAuditImage is the audited form of a key.
+//
+// The hash and the prefix are deliberately absent. The hash is the verifier for a live credential,
+// and this table is append-only and cannot be pruned — a hash written here would be a permanent
+// copy of the only thing needed to check a forged key against the database. What is recorded is
+// what the API itself exposes, which is enough to identify the key in a review: its name, enough
+// of the prefix to match it against the console, and its scope, which is what bounded it.
+func apiKeyAuditImage(k APIKey) map[string]any {
+	scopes := make([]string, 0, len(k.Scopes))
+	for _, s := range k.Scopes {
+		scopes = append(scopes, string(s))
+	}
+	return map[string]any{
+		"name":       k.Name,
+		"prefix":     k.Prefix,
+		"scopes":     scopes,
+		"expires_at": k.ExpiresAt,
+		"revoked_at": k.RevokedAt,
+	}
 }
 
 // Mint creates a key for a tenant.
@@ -139,7 +162,20 @@ func (s *APIKeyStore) Mint(
 			}
 			return fmt.Errorf("insert api key: %w", err)
 		}
-		return nil
+
+		// Recorded inside this transaction, like every other mutation in this service (ADR-006).
+		// A key that exists with no entry saying who created it is precisely the case an incident
+		// review asks about, and the answer must not depend on a second, later write succeeding.
+		return audit.Write(ctx, tx, audit.Entry{
+			TenantID:   tenantID,
+			ActorID:    &key.CreatedBy,
+			ActorKind:  audit.ActorUser,
+			Action:     audit.ActionAPIKeyCreate,
+			Resource:   "api_key",
+			ResourceID: &key.ID,
+			After:      apiKeyAuditImage(key),
+			RequestID:  reqid.From(ctx),
+		})
 	})
 	if err != nil {
 		return MintedAPIKey{}, err
@@ -272,10 +308,42 @@ func (s *APIKeyStore) List(ctx context.Context, tenantID, actorID uuid.UUID) ([]
 	return out, nil
 }
 
+// loadKey reads one key in the caller's tenant, for building an audit image.
+//
+// The tenant predicate is in the WHERE clause as well as being enforced by the policy. Relying on
+// the policy alone would make "a foreign key id is indistinguishable from an unknown one" a
+// consequence of the policy rather than of the query — and that property is what keeps the revoke
+// endpoint from answering a question about another tenant.
+func loadKey(ctx context.Context, tx pgx.Tx, tenantID, keyID uuid.UUID) (APIKey, error) {
+	var (
+		k      APIKey
+		scopes []string
+	)
+	err := tx.QueryRow(ctx, `
+		SELECT id, tenant_id, created_by, name, prefix, scopes,
+		       created_at, last_used_at, expires_at, revoked_at
+		  FROM api_keys
+		 WHERE id = $1 AND tenant_id = $2`, keyID, tenantID).
+		Scan(&k.ID, &k.TenantID, &k.CreatedBy, &k.Name, &k.Prefix, &scopes,
+			&k.CreatedAt, &k.LastUsedAt, &k.ExpiresAt, &k.RevokedAt)
+	if err != nil {
+		return APIKey{}, err
+	}
+	k.Scopes = make([]authz.Perm, 0, len(scopes))
+	for _, sc := range scopes {
+		k.Scopes = append(k.Scopes, authz.Perm(sc))
+	}
+	return k, nil
+}
+
 // Revoke revokes a key. Revoking an already-revoked key is a no-op rather than an
 // error, so a retried request behaves the same as the one it retried.
 func (s *APIKeyStore) Revoke(ctx context.Context, tenantID, actorID, keyID uuid.UUID) error {
-	if tenantID == uuid.Nil || keyID == uuid.Nil {
+	// actorID is required because revocation is recorded as an action a person took. A key cannot
+	// revoke keys — apikey:manage is forbidden to machine credentials — so a zero actor here means
+	// a caller passed an identity it does not have, and an audit entry naming nobody is worse than
+	// a refused request.
+	if tenantID == uuid.Nil || actorID == uuid.Nil || keyID == uuid.Nil {
 		return apperr.ErrNoScope
 	}
 
@@ -306,7 +374,9 @@ func (s *APIKeyStore) Revoke(ctx context.Context, tenantID, actorID, keyID uuid.
 			case err != nil:
 				return fmt.Errorf("check revocation state: %w", err)
 			case revokedAt != nil:
-				return nil // already revoked, so the caller's intent is satisfied
+				// Already revoked, so the caller's intent is satisfied and nothing changed. No
+				// entry is written: this trail records changes, and a repeated no-op is not one.
+				return nil
 			default:
 				// Unreachable in practice: a live row in this tenant would have been
 				// updated above. Kept explicit rather than returning nil so that a
@@ -315,7 +385,32 @@ func (s *APIKeyStore) Revoke(ctx context.Context, tenantID, actorID, keyID uuid.
 				return fmt.Errorf("revoke api key: %w", apperr.ErrNotFound)
 			}
 		}
-		return nil
+
+		// Read back inside the transaction so the entry describes what the database recorded rather
+		// than what this process intended. The before image is the same row with the revocation
+		// removed, which is exactly the state the UPDATE matched — its predicate was
+		// `revoked_at IS NULL`, so no separate read is needed to know what was there.
+		after, err := loadKey(ctx, tx, tenantID, keyID)
+		if err != nil {
+			return fmt.Errorf("read api key after revoke: %w", err)
+		}
+		before := after
+		before.RevokedAt = nil
+
+		// Recorded inside this transaction (ADR-006). A revoked key with no entry saying who
+		// revoked it leaves the first question of an incident review — who killed this credential,
+		// and when — unanswerable from the trail, which is the whole reason the trail exists.
+		return audit.Write(ctx, tx, audit.Entry{
+			TenantID:   tenantID,
+			ActorID:    &actorID,
+			ActorKind:  audit.ActorUser,
+			Action:     audit.ActionAPIKeyRevoke,
+			Resource:   "api_key",
+			ResourceID: &keyID,
+			Before:     apiKeyAuditImage(before),
+			After:      apiKeyAuditImage(after),
+			RequestID:  reqid.From(ctx),
+		})
 	})
 }
 

@@ -77,6 +77,13 @@ const (
 	ActionWebhookEndpointCreate = "webhook_endpoint.create"
 	ActionWebhookEndpointUpdate = "webhook_endpoint.update"
 	ActionWebhookDeliveryReplay = "webhook_delivery.replay"
+
+	// API-key actions. A key is a durable credential that outlives the person who minted it and
+	// acts without a human present, so "which key is this and who created it" is the first
+	// question an incident review asks — and for a key that was exfiltrating data, the creation
+	// entry is the only record that ties it to a person.
+	ActionAPIKeyCreate = "api_key.create"
+	ActionAPIKeyRevoke = "api_key.revoke"
 )
 
 // Entry is one audit record.

@@ -153,6 +153,7 @@ func newServerWith(t *testing.T, cfg serverConfig) *server {
 		Audit:          auditReader,
 		Invoices:       invoiceStore,
 		Webhooks:       webhookStore,
+		APIKeys:        keys,
 		SSRF:           ssrfGuard,
 		Idempotency:    idem,
 		RateLimits:     cfg.rateLimits,

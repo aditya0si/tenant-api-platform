@@ -55,6 +55,14 @@ type Deps struct {
 	// for the same reason as Invoices.
 	Webhooks *webhook.Store
 
+	// APIKeys owns machine-credential management. Nil disables those routes, for the same reason
+	// as Invoices and Webhooks.
+	//
+	// It is a separate store from the authenticator's, which is deliberate: authentication needs
+	// to resolve a presented key before any tenant is known, while management operates inside an
+	// already-resolved tenant. Same table, two different questions.
+	APIKeys *authn.APIKeyStore
+
 	// SSRF validates tenant-supplied delivery targets. Nil makes registration refuse rather
 	// than skip the check: a tenant-supplied URL with nothing validating it is a request to
 	// whatever address they name, including the cloud metadata service.
@@ -162,6 +170,37 @@ func registerWebhookRoutes(r chi.Router, d Deps) {
 			// retrying it after a lost response would otherwise reset the attempt count again and
 			// make the delivery history unreadable.
 			r.Post("/deliveries/{deliveryID}/replay", d.handleReplayWebhookDelivery)
+		})
+	})
+}
+
+// registerAPIKeyRoutes attaches machine-credential management, if this deployment has it.
+//
+// Same shape as registerInvoiceRoutes and for the same reason: a router assembled without the
+// store gets no endpoints rather than endpoints that panic inside a nil receiver.
+//
+// # Why the read and write permissions split here
+//
+// apikey:read is granted to a machine credential (the one deliberate exception in
+// authz.keyForbiddenPerms) so automation can list its siblings — an observability convenience with
+// no escalation path. apikey:manage is human-only, because a key that can mint keys survives its
+// own revocation by issuing a successor first, and a key that can revoke is a denial-of-service
+// primitive against every other integration in the tenant. Both writes are guarded: a retried
+// create must not mint a second key with a different secret.
+func registerAPIKeyRoutes(r chi.Router, d Deps) {
+	if d.APIKeys == nil {
+		return
+	}
+
+	r.Route("/api-keys", func(r chi.Router) {
+		r.With(authz.Require(authz.PermAPIKeyRead)).Get("/", d.handleListAPIKeys)
+
+		r.Group(func(r chi.Router) {
+			r.Use(writeGuard(string(authz.PermAPIKeyManage), d.Idempotency, d.Log))
+			r.Post("/", d.handleCreateAPIKey)
+			// Revocation is a guarded write rather than a delete, because every request that
+			// changes a credential's status should be attributable and replay-safe.
+			r.Delete("/{keyID}", d.handleRevokeAPIKey)
 		})
 	})
 }
@@ -295,6 +334,7 @@ func New(d Deps) http.Handler {
 
 		registerInvoiceRoutes(r, d)
 		registerWebhookRoutes(r, d)
+		registerAPIKeyRoutes(r, d)
 
 		r.Route("/projects", func(r chi.Router) {
 			// Reads are safe, so they need only the read permission — and deliberately no

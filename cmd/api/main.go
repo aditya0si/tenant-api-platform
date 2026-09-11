@@ -178,11 +178,16 @@ func run() error {
 	// these stay put until a deployment has a measured reason to differ.
 	idempotencyStore := idempotency.NewStore(pool, 0, 0)
 
+	apiKeys := authn.NewAPIKeyStore(pool)
+
+	// One store, two consumers: the authenticator resolves a presented key before any tenant is
+	// known, and the HTTP surface manages keys inside a resolved tenant. Sharing the value keeps
+	// the two paths running the same SQL rather than two copies of it.
 	authService, err := authn.NewService(
 		authn.NewUserStore(pool),
 		tokens,
 		authn.NewRefreshStore(pool, cfg.RefreshReuseGrace),
-		authn.NewAPIKeyStore(pool),
+		apiKeys,
 		httpx.MembershipLister{Tenants: tenants},
 		log,
 	)
@@ -200,6 +205,7 @@ func run() error {
 		Projects:       projects,
 		Invoices:       invoices,
 		Webhooks:       webhooks,
+		APIKeys:        apiKeys,
 		SSRF:           ssrfGuard,
 		Cursors:        codec,
 		Audit:          auditReader,

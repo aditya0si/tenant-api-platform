@@ -11,7 +11,7 @@ TEST_REDIS_URL ?= redis://localhost:6379/1
 export MIGRATE_DATABASE_URL := $(PG_URL_OWNER)
 export DATABASE_URL := $(PG_URL_APP)
 
-.PHONY: help tidy fmt vet test test-db build up down logs psql migrate seed sweep testdb-clean
+.PHONY: help tidy fmt vet test test-db build up down logs psql migrate seed sweep testdb-clean load load-seed
 
 help:
 	@echo "make up          start postgres + redis + migrate + api"
@@ -20,6 +20,8 @@ help:
 	@echo "make migrate     apply migrations to the dev database"
 	@echo "make sweep       reap expired idempotency keys (owner credentials; see docs/OPERATIONS.md)"
 	@echo "make seed        create two demo tenants"
+	@echo "make load-seed   provision tenants for the k6 load test (30 by default)"
+	@echo "make load        run the k6 load test and write load/results.json"
 	@echo "make psql        open a psql shell as the application role"
 
 tidy:
@@ -80,6 +82,24 @@ sweep:
 
 seed:
 	go run ./cmd/migrate seed
+
+# Provision tenants for the load test. Separate from `make load` because the sessions it writes
+# expire with AccessTokenTTL (10 minutes), so seeding and measuring cannot be far apart.
+#
+# Tenants rather than one: PolicyAPI bounds authenticated traffic at 600 requests/minute *per
+# tenant*, so the achievable aggregate rate is bought with tenant count. See load/api.js.
+LOAD_TENANTS ?= 30
+
+load-seed:
+	go run ./cmd/loadseed -tenants $(LOAD_TENANTS) -out load/sessions.json
+
+# Runs the k6 load test. Needs the API on :8080 (make up, or go run ./cmd/api) and seeded
+# sessions (make load-seed). Produces load/results.json, which is the record behind any number
+# quoted in the README.
+load:
+	@command -v k6 >/dev/null 2>&1 || { echo "k6 is not on PATH: https://k6.io/docs/get-started/installation/"; exit 1; }
+	@test -f load/sessions.json || { echo "no load/sessions.json — run 'make load-seed' first"; exit 1; }
+	k6 run load/api.js
 
 psql:
 	psql "$(PG_URL_APP)"

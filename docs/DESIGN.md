@@ -21,11 +21,11 @@ Non-requirements: no payments/PSP, no multi-region, no blue/green, no DB-driven 
 ## B. Non-functional
 
 - Correctness > latency. Tenant leak = P0. Double-apply on retry = P0.
-- Local targets (laptop Docker, measured later, not claimed now): p95 < 150ms for CRUD at 200 rps; auth p95 < 100ms; webhook dispatch lag p99 < 30s.
+- Local targets (single laptop; the measured load numbers and their caveats are in the README): p95 < 150ms for CRUD at 200 rps; auth p95 < 100ms; webhook dispatch lag p99 < 30s.
 - Availability: single-node; graceful degradation — Redis down → fail-open with metric; DB down → 503 readiness, 500 with envelope, no panic.
 - Consistency: read-committed + app invariants; outbox gives at-least-once delivery, effectively-once processing via dedupe.
 - Security: server-side tenant enforcement, 404-not-403 on cross-tenant access, HMAC cursors, HMAC webhook signatures with timestamp tolerance, SSRF guard.
-- Observability: request ID everywhere, OTel traces HTTP→DB/Redis→worker, Prometheus histograms/counters, Grafana later.
+- Observability: request ID everywhere; the caller's W3C `traceparent` propagated into the outbox row so a delivery correlates with the request that caused it; Prometheus histograms/counters on the API and the worker. **Not implemented: OpenTelemetry instrumentation.** No span is created or exported and there is no collector — tracing today is correlation-id propagation, not distributed tracing, and the distinction is stated here rather than implied. Grafana later.
 
 ## C. Architecture
 

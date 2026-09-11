@@ -82,6 +82,34 @@ go test -race ./...
 - `.github/workflows/ci.yml` is the reference run: `gofmt`, `go vet`, the migrations, the full suite
   under `-race`, and `docker compose config`.
 
+## Measured, not asserted
+
+`load/api.js` is a [k6](https://k6.io) workload and `load/results.json` is the run it produced. The
+figures below come from that file, not from a console scroll.
+
+**Workload:** 30 tenants, one virtual user each, four reads per iteration paced to 7 requests/second
+per tenant — 210 rps nominal, **192 rps achieved** across a 30-second window. Writes run afterward in
+a separate 20-second window at ~24 rps, so their latency cannot contaminate the read figures.
+
+| Endpoint | avg | p95 | p99 |
+|---|---:|---:|---:|
+| `GET /v1/tenants/{id}/projects` | 20.4 ms | 38.5 ms | 46.2 ms |
+| `POST /v1/tenants/{id}/projects` | 36.0 ms | 49.0 ms | 60.1 ms |
+| `GET /v1/tenants/{id}/invoices` | 16.4 ms | 25.6 ms | 31.1 ms |
+| `GET /v1/tenants/{id}/api-keys` | 13.1 ms | 18.8 ms | 22.5 ms |
+| `GET /v1/me` | 11.2 ms | 22.4 ms | 31.5 ms |
+
+6,250 requests, **0 failures**, every threshold in the script passed. `docs/DESIGN.md` targets
+p95 < 150 ms for CRUD at 200 rps; the measured p95 is 38.5 ms at 192 rps.
+
+**What this is not.** Every component ran on one 13th-gen i7 laptop: the API as a native Windows
+binary, Postgres 16 and Redis 7 in Docker Desktop, all on loopback with no TLS and no network hop. It
+bounds this application's own overhead and says nothing about a distributed deployment. The rate
+limiter was held at 70% of each tenant's ceiling (7 of 10 rps) so no request was throttled — the
+numbers measure the endpoints, not the limiter.
+
+Reproduce with `make load-seed && make load`.
+
 ## Decisions worth arguing about
 
 | Decision | Why |
@@ -96,10 +124,10 @@ go test -race ./...
 ## Status
 
 M0–M8 are implemented, tested, and committed: tenancy, authentication, projects, invoices,
-idempotency, rate limiting, audit, and webhooks.
+idempotency, rate limiting, audit, webhooks, and API-key management. CI is green on `main`.
 
 Not done yet, and stated rather than implied: the hand-written OpenAPI spec and its contract test
-([ADR-010](docs/adr/ADR-010-router-and-openapi.md)), k6 load numbers, and a deployed instance.
+([ADR-010](docs/adr/ADR-010-router-and-openapi.md)), and a deployed instance.
 
 ## License
 

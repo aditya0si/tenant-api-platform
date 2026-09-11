@@ -14,6 +14,7 @@ import (
 	"github.com/aditya0si/tenant-api-platform/internal/authn"
 	"github.com/aditya0si/tenant-api-platform/internal/authz"
 	"github.com/aditya0si/tenant-api-platform/internal/idempotency"
+	"github.com/aditya0si/tenant-api-platform/internal/invoice"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/cursor"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/httperr"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/metrics"
@@ -42,6 +43,12 @@ type Deps struct {
 	Projects *project.Store
 	Cursors  *cursor.Codec
 
+	// Invoices owns the billing surface. When nil the invoice routes are not registered at
+	// all, so chi's NotFound handler answers and the endpoint genuinely does not exist —
+	// rather than existing and panicking inside a nil store, which is what happened before
+	// registerInvoiceRoutes checked. See its comment.
+	Invoices *invoice.Store
+
 	// Audit reads the append-only trail. There is deliberately no writer here: entries are
 	// recorded by the operations they describe, inside those operations' transactions, so
 	// the HTTP layer can only ever read them. A nil value makes the endpoint report
@@ -62,6 +69,53 @@ type Deps struct {
 	// AccessTokenTTL is reported to clients so they know when to refresh without
 	// hard-coding a value that lives in configuration.
 	AccessTokenTTL int
+}
+
+// registerInvoiceRoutes attaches the billing surface, if this deployment has one.
+//
+// It is a function rather than an inline block so the nil check can return early. A router
+// assembled without a billing store — a probe harness, a test that only exercises routing —
+// then gets no invoice endpoints at all, and chi's NotFound handler answers for them.
+//
+// Registering them anyway panics on the first request: the handler reaches a nil
+// *invoice.Store, and Go dispatches the method before any of its own checks can run, so the
+// panic happens at the first field access inside Create. That is a 500 for what is a
+// configuration decision rather than an error, which is the least useful response available —
+// and it was a live bug until this function existed, because the field's own documentation
+// promised not-found.
+//
+// The alternative, a nil check in each of the nine handlers, is nine places to forget.
+func registerInvoiceRoutes(r chi.Router, d Deps) {
+	if d.Invoices == nil {
+		return
+	}
+
+	r.Route("/invoices", func(r chi.Router) {
+		// Reads need invoice:read, which every role including member holds: an invoice is
+		// part of the work someone was invited to do.
+		r.With(authz.Require(authz.PermInvoiceRead)).Get("/", d.handleListInvoices)
+		r.With(authz.Require(authz.PermInvoiceRead)).Get("/{invoiceID}", d.handleGetInvoice)
+
+		// Edits require invoice:write (admin and owner).
+		r.Group(func(r chi.Router) {
+			r.Use(writeGuard(string(authz.PermInvoiceWrite), d.Idempotency, d.Log))
+			r.Post("/", d.handleCreateInvoice)
+			r.Post("/{invoiceID}/items", d.handleAddInvoiceItem)
+			r.Delete("/{invoiceID}/items/{itemID}", d.handleRemoveInvoiceItem)
+			r.Post("/{invoiceID}/issue", d.handleIssueInvoice)
+		})
+
+		// Settling requires invoice:settle, which is stronger than invoice:write and is held
+		// by the same roles today. It is a separate permission because the two are
+		// conceptually distinct — editing what an invoice says is not the same act as
+		// declaring it paid — so a future role that can draft but not settle is a permission
+		// change rather than a refactor. Both are guarded writes.
+		r.Group(func(r chi.Router) {
+			r.Use(writeGuard(string(authz.PermInvoiceSettle), d.Idempotency, d.Log))
+			r.Post("/{invoiceID}/pay", d.handlePayInvoice)
+			r.Post("/{invoiceID}/void", d.handleVoidInvoice)
+		})
+	})
 }
 
 // requirePerm is the authorization middleware as a plain function, so a composition like
@@ -187,6 +241,8 @@ func New(d Deps) http.Handler {
 		// member. It names who did what, including API keys and request ids, so an admin who
 		// can rename a workspace is not automatically able to enumerate its users' actions.
 		r.With(authz.Require(authz.PermAuditRead)).Get("/audit", d.handleListAudit)
+
+		registerInvoiceRoutes(r, d)
 
 		r.Route("/projects", func(r chi.Router) {
 			// Reads are safe, so they need only the read permission — and deliberately no

@@ -59,6 +59,16 @@ const (
 	ActionProjectCreate  = "project.create"
 	ActionProjectUpdate  = "project.update"
 	ActionProjectArchive = "project.archive"
+
+	// Invoice actions. The lifecycle transitions are recorded as distinct verbs rather than
+	// as one "invoice.update", because "when was this paid" is the question actually asked of
+	// an invoice and it should not require diffing two images to answer.
+	ActionInvoiceCreate      = "invoice.create"
+	ActionInvoiceItemAdded   = "invoice.item_added"
+	ActionInvoiceItemRemoved = "invoice.item_removed"
+	ActionInvoiceIssued      = "invoice.issued"
+	ActionInvoicePaid        = "invoice.paid"
+	ActionInvoiceVoided      = "invoice.voided"
 )
 
 // Entry is one audit record.

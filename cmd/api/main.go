@@ -33,6 +33,7 @@ import (
 	"github.com/aditya0si/tenant-api-platform/internal/authn"
 	"github.com/aditya0si/tenant-api-platform/internal/httpx"
 	"github.com/aditya0si/tenant-api-platform/internal/idempotency"
+	"github.com/aditya0si/tenant-api-platform/internal/invoice"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/cache"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/clientip"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/config"
@@ -146,6 +147,7 @@ func run() error {
 	tenants := tenant.NewStore(pool)
 	projects := project.NewStore(pool)
 	auditReader := audit.NewReader(pool)
+	invoices := invoice.NewStore(pool)
 
 	// Idempotency retention and lease are deliberately not configurable.
 	//
@@ -177,6 +179,7 @@ func run() error {
 		Users:          authn.NewUserStore(pool),
 		Tenants:        tenants,
 		Projects:       projects,
+		Invoices:       invoices,
 		Cursors:        codec,
 		Audit:          auditReader,
 		Idempotency:    idempotencyStore,

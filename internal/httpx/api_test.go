@@ -33,6 +33,7 @@ import (
 	"github.com/aditya0si/tenant-api-platform/internal/authz"
 	"github.com/aditya0si/tenant-api-platform/internal/httpx"
 	"github.com/aditya0si/tenant-api-platform/internal/idempotency"
+	"github.com/aditya0si/tenant-api-platform/internal/invoice"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/cursor"
 	"github.com/aditya0si/tenant-api-platform/internal/project"
 	"github.com/aditya0si/tenant-api-platform/internal/tenant"
@@ -117,6 +118,7 @@ func newServerWith(t *testing.T, cfg serverConfig) *server {
 	// the same SQL that runs in production.
 	idem := idempotency.NewStore(d.App, 0, 0)
 	auditReader := audit.NewReader(d.App)
+	invoiceStore := invoice.NewStore(d.App)
 
 	svc, err := authn.NewService(
 		users, tokens,
@@ -137,6 +139,7 @@ func newServerWith(t *testing.T, cfg serverConfig) *server {
 		Projects:       projects,
 		Cursors:        codec,
 		Audit:          auditReader,
+		Invoices:       invoiceStore,
 		Idempotency:    idem,
 		RateLimits:     cfg.rateLimits,
 		AccessTokenTTL: 600,

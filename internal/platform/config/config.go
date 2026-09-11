@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aditya0si/tenant-api-platform/internal/authn"
@@ -45,6 +46,18 @@ type Config struct {
 	// token is treated as a concurrent retry rather than as theft. Zero means
 	// strictly single-use, at the cost of logging out clients that race themselves.
 	RefreshReuseGrace time.Duration
+
+	// TrustedProxyCIDRs lists the networks whose forwarding headers may be believed.
+	//
+	// It defaults to empty, which means "trust nothing" — every request is attributed to its
+	// socket address, which a caller cannot forge. That is the safe default, and it is the
+	// right one here because getting it wrong is silent: a service behind an unconfigured
+	// proxy shares one rate-limit bucket among every client, and a service trusting headers it
+	// should not has a limiter anyone can bypass with one extra header.
+	//
+	// Setting it is an operator's assertion that the service is unreachable except through
+	// those proxies.
+	TrustedProxyCIDRs []string
 
 	LogLevel string
 }
@@ -91,6 +104,17 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("config: JWT_SECRET must be at least 32 characters, got %d", len(secret))
 	}
 	c.JWTSecret = []byte(secret)
+
+	// A comma-separated list, because that is what a deployment manifest already has room
+	// for: repeating an env var is not portable across orchestrators, and a YAML array would
+	// tie the configuration format to one platform.
+	if raw := os.Getenv("TRUSTED_PROXY_CIDRS"); raw != "" {
+		for _, cidr := range strings.Split(raw, ",") {
+			if cidr = strings.TrimSpace(cidr); cidr != "" {
+				c.TrustedProxyCIDRs = append(c.TrustedProxyCIDRs, cidr)
+			}
+		}
+	}
 
 	if c.AccessTokenTTL, err = durationEnv("ACCESS_TOKEN_TTL", authn.DefaultAccessTTL); err != nil {
 		return Config{}, err

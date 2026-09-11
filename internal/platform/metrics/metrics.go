@@ -31,4 +31,14 @@ var (
 		Name: "ratelimit_degraded_total",
 		Help: "Requests allowed fail-open because Redis was unavailable.",
 	})
+
+	// RateLimitLimited counts requests refused by the limiter, per policy.
+	//
+	// A 429 that nobody counts is a support ticket with no data behind it: the first question
+	// about a throttled client is "is this the limit working or the limit set wrongly", and
+	// that cannot be answered from request logs alone.
+	RateLimitLimited = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "ratelimit_limited_total",
+		Help: "Requests refused by the rate limiter, by policy.",
+	}, []string{"policy"})
 )

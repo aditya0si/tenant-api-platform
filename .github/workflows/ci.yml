@@ -24,6 +24,20 @@ jobs:
           --health-timeout 3s
           --health-retries 20
 
+      # The rate limiter's tests run against a real Redis for the same reason the isolation
+      # tests run against a real Postgres: the behaviour being verified is "what happens when
+      # the window slides, when the script runs, and when the connection is refused", and a
+      # fake answers none of those. TEST_REDIS_URL points the suite here.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
     env:
       MIGRATE_DATABASE_URL: postgres://postgres:postgres@localhost:5432/tenant_platform_test?sslmode=disable
       DATABASE_URL: postgres://app_rw:app_rw@localhost:5432/tenant_platform_test?sslmode=disable
@@ -58,6 +72,8 @@ jobs:
       # a green run here is evidence the policies are in force.
       - name: test (race)
         run: go test -race -count=1 ./...
+        env:
+          TEST_REDIS_URL: redis://localhost:6379/1
 
       - name: build
         run: go build ./...

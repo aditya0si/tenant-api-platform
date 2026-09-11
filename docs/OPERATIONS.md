@@ -64,6 +64,53 @@ rather than tidy: superusers and `BYPASSRLS` roles ignore row-level security, so
 returning 200. `cmd/api` refuses to start in that configuration unless
 `ALLOW_PRIVILEGED_DB_ROLE=1` is set, which exists for local debugging only.
 
+## Rate limiting
+
+Login, registration, and refresh are limited per client address; authenticated traffic is
+limited per tenant. Policies live in `internal/httpx/ratelimit.go` as code constants rather
+than configuration, because each is coupled to what it protects (see `docs/adr/ADR-005-rate-limiting.md`).
+
+**Address attribution is the part that needs configuring.** By default the service trusts no
+forwarding header and attributes every request to its socket address, which a caller cannot
+forge:
+
+```sh
+TRUSTED_PROXY_CIDRS=10.0.0.0/8,192.168.0.0/16
+```
+
+Set this only when the service is unreachable except through those proxies. Both ways of
+getting it wrong are silent, which is why the default is the safe one:
+
+- **Unset while behind a proxy** — every client shares one bucket and throttles each other.
+  The service logs this at startup so it is not discovered from a support ticket.
+- **Set when the peer is not a proxy** — the limiter is bypassable with one extra header.
+
+Within a trusted chain, `X-Forwarded-For` is walked right to left, because each proxy appends
+and the leftmost entry is therefore whatever the original client supplied. An entry that does
+not parse as an address stops the walk and the peer is used instead: over-attributing clients
+behind a proxy to one bucket is a degradation, while adopting an unparseable value as a key
+would let a caller choose its own bucket.
+
+### When Redis is down
+
+The limiter fails **open**: requests are allowed, and that is deliberate, because refusing all
+traffic would turn a cache outage into a total outage. The degradation is visible rather than
+silent:
+
+- `ratelimit_degraded_total` increments on every fail-open decision (the log line is
+  rate-limited to one a minute; the metric carries the volume).
+- Responses carry `X-RateLimit-Degraded: true`, and deliberately do **not** advertise
+  `Remaining` — room that is not known to exist must not be claimed.
+
+Readiness reports `degraded` while Redis is unreachable but stays **200**, so a functioning
+instance is not taken out of rotation over an optional dependency.
+
+A *server-side* error is the opposite case and is fatal at startup: it means the script is
+wrong rather than Redis being absent, and a service that starts with an unusable limiter
+enforces nothing while reporting healthy. If the API refuses to boot with
+`rate limiter script for policy ... is invalid`, the script and Redis disagree and the process
+is right not to start.
+
 ## Tests
 
 ```sh

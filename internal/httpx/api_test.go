@@ -72,6 +72,13 @@ type serverConfig struct {
 	// could only exercise one of them would leave the other unverified — and the
 	// default is the one that runs in production.
 	refreshGrace time.Duration
+
+	// rateLimits enables limiting for this server. Nil means none, which is what most
+	// tests want: a limiter would refuse the tenth rapid request to an endpoint and
+	// silently turn an unrelated assertion into a 429. Tests that are *about* limiting
+	// supply one, so the middleware under test is the production middleware rather than a
+	// stub.
+	rateLimits *httpx.RateLimits
 }
 
 // newServer builds the API with production-like settings.
@@ -124,6 +131,7 @@ func newServerWith(t *testing.T, cfg serverConfig) *server {
 		Projects:       projects,
 		Cursors:        codec,
 		Idempotency:    idem,
+		RateLimits:     cfg.rateLimits,
 		AccessTokenTTL: 600,
 	})
 

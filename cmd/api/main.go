@@ -33,11 +33,13 @@ import (
 	"github.com/aditya0si/tenant-api-platform/internal/httpx"
 	"github.com/aditya0si/tenant-api-platform/internal/idempotency"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/cache"
+	"github.com/aditya0si/tenant-api-platform/internal/platform/clientip"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/config"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/cursor"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/db"
 	"github.com/aditya0si/tenant-api-platform/internal/platform/logging"
 	"github.com/aditya0si/tenant-api-platform/internal/project"
+	"github.com/aditya0si/tenant-api-platform/internal/ratelimit"
 	"github.com/aditya0si/tenant-api-platform/internal/tenant"
 )
 
@@ -88,7 +90,7 @@ func run() error {
 
 	rdb, err := cache.NewClient(cfg.RedisURL)
 	if err != nil {
-		// Redis is not required yet (the rate limiter arrives with M5). It is
+		// Redis is not required: the rate limiter fails open without it. It is
 		// constructed so readiness can report on it, and an unparseable URL is a
 		// warning rather than a fatal error: failing startup over an optional
 		// dependency would make Redis a hard requirement by accident.
@@ -96,6 +98,35 @@ func run() error {
 		rdb = nil
 	} else {
 		defer func() { _ = rdb.Close() }()
+	}
+
+	// Trusted proxies are parsed before anything uses the resolver, so a malformed CIDR is a
+	// startup failure rather than a runtime surprise. A typo here silently changes every
+	// unauthenticated limit from per-client to per-proxy, and the only symptom is that
+	// clients start throttling each other.
+	proxyResolver, err := clientip.New(cfg.TrustedProxyCIDRs)
+	if err != nil {
+		return fmt.Errorf("config: TRUSTED_PROXY_CIDRS: %w", err)
+	}
+
+	limits := httpx.RateLimits{IP: proxyResolver}
+	if rdb != nil {
+		limits.Login = ratelimit.New(rdb, httpx.PolicyLogin, log)
+		limits.Register = ratelimit.New(rdb, httpx.PolicyRegister, log)
+		limits.Refresh = ratelimit.New(rdb, httpx.PolicyRefreshIP, log)
+		limits.API = ratelimit.New(rdb, httpx.PolicyAPI, log)
+
+		// The script is loaded once so a broken script is a failed boot rather than a limiter
+		// that permits everything while the process reports healthy. An unreachable Redis is
+		// not an error here — that is the degraded state the service is designed to run in.
+		for _, l := range []*ratelimit.Limiter{limits.Login, limits.Register, limits.Refresh, limits.API} {
+			if err := l.Validate(ctx); err != nil {
+				return fmt.Errorf("rate limiter script for policy %q is invalid: %w", l.Policy().Name, err)
+			}
+		}
+	} else {
+		log.Warn("rate limiting is disabled: no usable Redis URL. Unsafe-endpoint limits " +
+			"(login, register, refresh) will not be enforced.")
 	}
 
 	tokens, err := authn.NewTokenIssuer(cfg.JWTSecret, authn.DefaultIssuer, authn.DefaultAudience, cfg.AccessTokenTTL)
@@ -146,6 +177,7 @@ func run() error {
 		Projects:       projects,
 		Cursors:        codec,
 		Idempotency:    idempotencyStore,
+		RateLimits:     &limits,
 		AccessTokenTTL: int(cfg.AccessTokenTTL.Seconds()),
 	})
 

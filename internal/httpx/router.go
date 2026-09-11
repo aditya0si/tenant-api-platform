@@ -46,6 +46,12 @@ type Deps struct {
 	// behaviour; production always supplies one.
 	Idempotency *idempotency.Store
 
+	// RateLimits are the limiters applied at the HTTP boundary. Nil means no limiting,
+	// which lets a test exercise routing without standing up Redis; production always
+	// supplies them. A nil field is treated as "no limit" rather than as an error, because
+	// the limit protects against abuse rather than correctness.
+	RateLimits *RateLimits
+
 	// AccessTokenTTL is reported to clients so they know when to refresh without
 	// hard-coding a value that lives in configuration.
 	AccessTokenTTL int
@@ -84,13 +90,26 @@ func New(d Deps) http.Handler {
 	// than as a bare connection close.
 	r.Use(middleware.RequestID)
 	r.Use(requestIDResponseHeader)
-	r.Use(middleware.RealIP)
+	// middleware.RealIP is deliberately absent.
+	//
+	// It rewrites RemoteAddr from X-Forwarded-For unconditionally, which is correct only when
+	// the service is unreachable except through a proxy that overwrites the header. Anywhere
+	// else it lets a caller choose their own apparent address, and an IP-keyed rate limit
+	// then costs an attacker one extra header to bypass — leaving a limiter that reports it
+	// is enforcing a limit while enforcing nothing.
+	//
+	// Address attribution is done by clientip, which honours the header only from declared
+	// proxy ranges. Removing RealIP is what makes that possible: leaving it in would mean the
+	// socket peer had already been overwritten before anything could judge whether the
+	// header deserved to be believed.
 	r.Use(instrument)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(requestTimeout))
 
 	auth := authn.NewAuthenticator(d.Auth, d.Log)
 	r.Use(auth.Middleware)
+
+	logRateLimitConfig(d.Log, d.limits().IP)
 
 	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
 		httperr.Write(w, r, http.StatusNotFound, "not_found", "no such endpoint")
@@ -105,14 +124,24 @@ func New(d Deps) http.Handler {
 	r.Handle("/metrics", promhttp.Handler())
 
 	// --- unauthenticated -----------------------------------------------------
+	// Each endpoint carries its own policy, applied per route rather than to the group.
+	// Login and register are the endpoints an attacker reaches without credentials, so the
+	// tight limits belong on them specifically; a group-wide limit would have to be the
+	// loosest of the set to avoid throttling ordinary logins, which would leave the
+	// credential-stuffing surface effectively unbounded.
+	limits := d.limits()
 	r.Route("/v1/auth", func(r chi.Router) {
-		r.Post("/register", d.handleRegister)
-		r.Post("/login", d.handleLogin)
+		r.With(d.limitByIP(limits.Register)).Post("/register", d.handleRegister)
+		r.With(d.limitByIP(limits.Login)).Post("/login", d.handleLogin)
 		// Refresh and logout take the token in the body rather than a header,
 		// because the access token may already be expired at the moment they are
 		// called — requiring a valid Authorization header would make both
 		// unusable exactly when they are needed.
-		r.Post("/refresh", d.handleRefresh)
+		r.With(d.limitByIP(limits.Refresh)).Post("/refresh", d.handleRefresh)
+		// Logout is deliberately unlimited. It carries a token in the body and performs one
+		// indexed delete, so its cost is bounded and it is not a guessing surface: a wrong
+		// token is refused without revealing whether it ever existed. Limiting it would add
+		// a failure mode to the one endpoint a client calls when it is already in trouble.
 		r.Post("/logout", d.handleLogout)
 	})
 
@@ -122,6 +151,11 @@ func New(d Deps) http.Handler {
 	// I act as" — the query a client needs in order to choose one.
 	r.Group(func(r chi.Router) {
 		r.Use(authn.RequireAuthentication)
+		// The authenticated limit applies here as well as inside the tenant group, because
+		// /v1/me and /v1/tenants are reached before any tenant is resolved and would
+		// otherwise be unbounded — an authenticated client could hammer them freely while
+		// every tenant-scoped route was politely limited.
+		r.Use(d.limitByPrincipal(limits.API))
 		r.Get("/v1/me", d.handleMe)
 		r.Get("/v1/tenants", d.handleListMyTenants)
 		r.Post("/v1/tenants", d.handleCreateTenant)
@@ -133,6 +167,10 @@ func New(d Deps) http.Handler {
 	r.Route("/v1/tenants/{tenantID}", func(r chi.Router) {
 		r.Use(ResolveTenant(d.Tenants, d.Log))
 		r.Use(RequireAuthorized)
+		// After tenant resolution, so the bucket keys on the tenant: the limit exists to
+		// bound what one tenant can cost the others, and keying it any earlier would have to
+		// use the address and would let a tenant with many members multiply its own share.
+		r.Use(d.limitByPrincipal(limits.API))
 
 		r.Get("/", d.handleGetTenant)
 		r.Get("/members", d.handleListMembers)

@@ -6,6 +6,8 @@ TEST_DB      ?= tenant_platform_test
 TEST_URL_OWNER ?= postgres://postgres:postgres@localhost:5432/$(TEST_DB)?sslmode=disable
 TEST_URL_APP   ?= postgres://app_rw:app_rw@localhost:5432/$(TEST_DB)?sslmode=disable
 
+TEST_REDIS_URL ?= redis://localhost:6379/1
+
 export MIGRATE_DATABASE_URL := $(PG_URL_OWNER)
 export DATABASE_URL := $(PG_URL_APP)
 
@@ -52,6 +54,7 @@ testdb-clean:
 test-with-db:
 	TEST_DATABASE_URL="$(TEST_URL_APP)" \
 	TEST_MIGRATE_DATABASE_URL="$(TEST_URL_OWNER)" \
+	TEST_REDIS_URL="$(TEST_REDIS_URL)" \
 	go test -race -count=1 ./...
 
 up:

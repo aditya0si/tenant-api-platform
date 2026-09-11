@@ -35,8 +35,8 @@ flowchart LR
 
 - `cmd/api` — the HTTP service.
 - `cmd/worker` — delivers outbox rows. Same image, different entrypoint, so the two cannot drift.
-- `cmd/migrate` — embedded forward-only migrations: `up`, `status`, `seed`, `sweep`.
-- `internal/…` — one package per concern; 28 packages in total.
+- `cmd/migrate` — embedded forward-only migrations (twelve of them): `up`, `status`, `seed`, `sweep`.
+- `internal/…` — one package per concern; 25 packages under `internal/`, 29 in the module.
 
 ## Isolation, enforced twice
 
@@ -77,6 +77,9 @@ go test -race ./...
 
 - 304 test functions across 15 packages, against a real Postgres and a real Redis — the isolation
   tests measure the policies Postgres actually applies, not a fake.
+- Statement coverage is 51.5% module-wide; the request-path packages carry it — `httpx` 76%,
+  `project` 85%, `ratelimit` 89%, `ssrf` 84%. The wiring packages (`cmd/…`, `config`, `db`, `audit`)
+  report 0% here because the compose smoke test exercises them as binaries, not through Go tests.
 - No test is skipped because a dependency is missing. A silently skipped isolation suite is worse
   than a red build, so the suite fails and says why.
 - `.github/workflows/ci.yml` is the reference run: `gofmt`, `go vet`, the migrations, the full suite
@@ -136,6 +139,9 @@ idempotency, rate limiting, audit, webhooks, and API-key management. CI is green
 Not done yet, and stated rather than implied: a deployed instance. Tracing is correlation-id
 propagation, not OpenTelemetry — no span is created or exported, and
 [`docs/DESIGN.md`](docs/DESIGN.md) says so rather than implying otherwise.
+
+Cost per request and uptime are deliberately absent from this README: with no deployment there is
+nothing to measure, and an invented number would be worse than a missing one.
 
 ## License
 
